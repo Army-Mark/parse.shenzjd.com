@@ -1,0 +1,23 @@
+# 行尾约定
+#
+# `*.patch` 必须保持 LF，**禁止任何行尾转换**。
+#
+# 原因：Windows 上 `core.autocrlf=true` 会在检出时把文本文件的 LF 转成 CRLF，
+# 于是 selfhost/patches/*.patch 在本地工作区变成 CRLF 文件；而 `git apply` 对行尾
+# 敏感，会以「patch failed / patch does not apply」大面积失败 —— 现象极具误导性：
+# 工作区明明是纯净的上游代码，补丁却应用不上。
+#
+# 仓库里的 blob 一直是 LF，所以 Linux CI（core.autocrlf=false）不受影响，
+# 问题只在 Windows 本地复现。`-text` 表示「不是文本」，git 不做任何 EOL 转换，
+# 检出内容与 blob 逐字节一致。
+#
+# 双保险：scripts/sync-upstream.mjs 与 scripts/verify-overlay.mjs 在应用补丁前
+# 还会主动剥掉 CR，兼容在加入本文件之前就已存在的检出。
+*.patch -text
+
+# delete.txt 由 scripts/export-overlay.mjs 以 LF 重写。若不做约定，Windows 上
+# core.autocrlf=true 会让「刚导出的工作区」与索引产生行尾差异，git status 报出
+# 伪修改 ` M selfhost/delete.txt`，进而触发 sync-upstream.mjs 的 ensureClean() 拦截
+# （表现为「明明没改，却说工作区不干净」）。`text eol=lf` 把 blob 与工作区都钉死为
+# LF，并保留文本属性（仍可正常 diff）。
+selfhost/delete.txt text eol=lf

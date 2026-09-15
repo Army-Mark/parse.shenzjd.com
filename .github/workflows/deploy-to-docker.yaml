@@ -1,5 +1,18 @@
 name: Test, build and deploy
 
+# 【自建改造】本服务器线上是 systemd 直跑 node（/opt/parse/app + server.js），
+# 与本工作流的 Docker 方案抢同一个 3000 端口，二者只能留一个。默认整体关闭：
+# 所有 job 都需要仓库变量 ENABLE_DOCKER_DEPLOY == 'true' 才执行，否则直接跳过。
+#
+# 为什么是「默认关闭」而不是删掉：
+#   1. 本工作流属于上游文件，每次同步都会被「固定为上一版本」，删掉又会被上游带回来，
+#      维护成本高；加一个开关更稳。
+#   2. 关闭后不再消耗 Actions 配额（每次同步 push 都会触发一次 Docker 构建并推 GHCR）。
+#
+# 想改用 Docker 部署：在 Settings → Secrets and variables → Actions → Variables 新建
+#   ENABLE_DOCKER_DEPLOY = true，并补齐 DEPLOY_HOST / DEPLOY_USER / DEPLOY_PASSWORD，
+#   同时停用 selfhost-sync.yml 里的 deploy 任务（否则两边同时抢端口）。
+
 on:
   push:
     branches: [main]
@@ -46,6 +59,8 @@ jobs:
   test:
     name: Run unit tests
     runs-on: ubuntu-latest
+    # 默认关闭：改用 systemd 部署后这条 Docker 链路只在显式开启时才跑（见文件头说明）
+    if: vars.ENABLE_DOCKER_DEPLOY == 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -74,6 +89,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     needs: [test]
+    if: vars.ENABLE_DOCKER_DEPLOY == 'true'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -133,7 +149,8 @@ jobs:
   deploy:
     needs: build
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
+    # 默认关闭；且仅 main 分支部署（见文件头说明）
+    if: github.ref == 'refs/heads/main' && vars.ENABLE_DOCKER_DEPLOY == 'true'
     steps:
       - name: Deploy to server
         uses: appleboy/ssh-action@v1
@@ -144,7 +161,14 @@ jobs:
           script: |
             IMAGE="ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]'):latest"
             CONTAINER="${{ github.event.repository.name }}"
-            ENV_FILE="/opt/1panel/apps/openresty/openresty/www/sites/parse.shenzjd.com/index/.env"
+            # 【改造说明】原路径硬编码作者服务器的站点目录，自建部署必须替换。
+            # 优先读取仓库变量 DEPLOY_ENV_FILE（Settings → Variables），
+            # 未配置时回退到应用目录下的 .env。
+            ENV_FILE="${{ vars.DEPLOY_ENV_FILE }}"
+            if [ -z "$ENV_FILE" ]; then ENV_FILE="/opt/parse/.env"; fi
+            # 宿主机映射端口同样可配，默认 3000
+            HOST_PORT="${{ vars.DEPLOY_PORT }}"
+            if [ -z "$HOST_PORT" ]; then HOST_PORT=3000; fi
             sudo docker pull "$IMAGE"
             sudo docker stop "$CONTAINER" || true
             sudo docker rm "$CONTAINER" || true
@@ -162,6 +186,6 @@ jobs:
               --restart unless-stopped \
               --init \
               $ENV_FLAGS \
-              -p 5269:3000 \
+              -p "${HOST_PORT}:3000" \
               "$IMAGE"
             sudo docker image prune -f

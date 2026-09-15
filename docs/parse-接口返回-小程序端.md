@@ -257,7 +257,7 @@ B站、抖音合集返回 `data.videos` 列表：
 ```js
 // 1. 请求
 const res = await wx.request({
-  url: 'https://parse.shenzjd.com/api/parse',
+  url: 'https://parse.113826.xyz/api/parse',
   data: { url: shareUrl }
 });
 

@@ -264,14 +264,27 @@ export const isBlockedIP = (ip) => {
   return BLOCKED_IPS.has(first);
 };
 
-// CORS 头生成 — 仅允许 *.shenzjd.com
-const ALLOWED_ORIGIN_SUFFIX = '.shenzjd.com';
-
+// CORS 头生成 — 允许来源由环境变量 ALLOWED_ORIGINS 控制（逗号分隔的域名或后缀）
+//
+// 【改造说明】原实现硬编码只允许 *.shenzjd.com（上游作者域名），自建部署到自有域名后，[rebrand-keep]
+// 任何跨域调用（小程序 / 其他站点 / 多域名前端）都会因缺少 Access-Control-Allow-Origin
+// 而被浏览器拦截。现改为按环境变量放行：
+//   ALLOWED_ORIGINS=example.com,api.example.com
+// 匹配规则：hostname 完全等于配置项，或为其子域（.example.com）。
+// 未配置时不返回 CORS 头（同源调用不受影响，这是默认且最安全的形态）。
+// 每次调用读取 env（而非模块级常量），便于测试注入与运行时调整。
 export const getCorsHeaders = (origin) => {
   if (!origin || typeof origin !== 'string') return {};
+
+  const allowed = String(process.env.ALLOWED_ORIGINS || '')
+    .split(',')
+    .map((d) => d.trim().toLowerCase())
+    .filter(Boolean);
+  if (allowed.length === 0) return {};
+
   try {
     const hostname = new URL(origin).hostname.toLowerCase();
-    if (hostname === 'shenzjd.com' || hostname.endsWith(ALLOWED_ORIGIN_SUFFIX)) {
+    if (allowed.some((d) => hostname === d || hostname.endsWith(`.${d}`))) {
       return { 'Access-Control-Allow-Origin': origin };
     }
   } catch {

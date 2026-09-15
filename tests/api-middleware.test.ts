@@ -1,7 +1,8 @@
 // @ts-nocheck
-import { describe, it, expect, vi, beforeEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { createApiHandler } from "@/lib/api-middleware";
 import * as apiUtils from "@/lib/api-utils";
+import { siteConfig } from "@/config/site";
 
 describe("api-middleware", () => {
   beforeEach(() => {
@@ -10,6 +11,10 @@ describe("api-middleware", () => {
     vi.spyOn(apiUtils, "isValidUrl").mockReturnValue(true);
     vi.spyOn(apiUtils, "sanitizeUrl").mockImplementation((url) => url);
     vi.spyOn(apiUtils, "getClientIP").mockReturnValue("203.0.113.42");
+  });
+
+  afterEach(() => {
+    delete process.env.ALLOWED_ORIGINS;
   });
 
   it("skips cache lookup when shouldCache is false", async () => {
@@ -77,26 +82,42 @@ describe("api-middleware", () => {
     expect(parseSpy).not.toHaveBeenCalled();
   });
 
-  it("returns CORS header for allowed origin (*.shenzjd.com)", async () => {
+  it("returns CORS header for origin listed in ALLOWED_ORIGINS", async () => {
+    // 【改造说明】CORS 放行名单由硬编码 *.shenzjd.com 改为环境变量 ALLOWED_ORIGINS [rebrand-keep]
+    process.env.ALLOWED_ORIGINS = "example.com";
     vi.spyOn(apiUtils, "getCachedResponse").mockReturnValue(null);
     const parseSpy = vi.fn().mockResolvedValue({ code: 1, msg: "ok" });
     const handler = createApiHandler(parseSpy, { shouldCache: false });
 
     const req = new Request("http://127.0.0.1/api/test?url=https://example.com", {
-      headers: { Origin: "https://parse.shenzjd.com" },
+      headers: { Origin: "https://parse.example.com" },
     });
     const res = await handler(req);
 
-    expect(res.headers.get("Access-Control-Allow-Origin")).toBe("https://parse.shenzjd.com");
+    expect(res.headers.get("Access-Control-Allow-Origin")).toBe("https://parse.example.com");
   });
 
   it("does not return CORS header for unauthorized origin", async () => {
+    process.env.ALLOWED_ORIGINS = "example.com";
     vi.spyOn(apiUtils, "getCachedResponse").mockReturnValue(null);
     const parseSpy = vi.fn().mockResolvedValue({ code: 1, msg: "ok" });
     const handler = createApiHandler(parseSpy, { shouldCache: false });
 
     const req = new Request("http://127.0.0.1/api/test?url=https://example.com", {
       headers: { Origin: "https://evil-site.com" },
+    });
+    const res = await handler(req);
+
+    expect(res.headers.get("Access-Control-Allow-Origin")).toBeNull();
+  });
+
+  it("未配置 ALLOWED_ORIGINS 时不放行任何跨域来源（默认最安全）", async () => {
+    vi.spyOn(apiUtils, "getCachedResponse").mockReturnValue(null);
+    const parseSpy = vi.fn().mockResolvedValue({ code: 1, msg: "ok" });
+    const handler = createApiHandler(parseSpy, { shouldCache: false });
+
+    const req = new Request("http://127.0.0.1/api/test?url=https://example.com", {
+      headers: { Origin: "https://parse.example.com" },
     });
     const res = await handler(req);
 
@@ -144,8 +165,9 @@ describe("api-middleware", () => {
     expect(parseSpy).toHaveBeenCalledTimes(1);
   });
 
-  it("returns honeypot (200 + 公众号宣传) for blacklisted IP instead of 403", async () => {
-    // 黑名单 IP 直连解析接口 → 不再 403，而是 200 + 结构化蜜罐数据（宣传公众号）
+  it("returns honeypot (200) for blacklisted IP instead of 403", async () => {
+    // 黑名单 IP 直连解析接口 → 不再 403，而是 200 + 结构化蜜罐数据。
+    // 【改造说明】蜜罐文案原先用于引流到作者公众号，已改为中性文案并取自本站配置。
     vi.spyOn(apiUtils, "getClientIP").mockReturnValue("120.42.187.174");
     const parseSpy = vi.fn();
     const handler = createApiHandler(parseSpy, { shouldCache: false });
@@ -157,10 +179,24 @@ describe("api-middleware", () => {
     expect(parseSpy).not.toHaveBeenCalled();
     const json = await res.json();
     expect(json.code).toBe(200);
-    // 蜜罐标志 + 宣传文案 + 引导链接
+    // 蜜罐标志 + 文案取自本站品牌 + 引导链接指向本站（不指向站外）
     expect(json.data.honeypot).toBe(true);
-    expect(json.msg).toContain("神族九帝");
-    expect(json.data.url).toContain("parse.shenzjd.com");
+    expect(json.msg).toContain(siteConfig.name);
+    expect(json.data.url).toContain(siteConfig.domain);
+  });
+
+  it("解析接口不再要求登录：无任何 Cookie / Authorization 也能正常解析（回归）", async () => {
+    // 【改造说明】原实现要求携带第三方微信认证凭证（wxauth-token Cookie 或
+    // Authorization: Bearer），未认证返回 401。该门禁已移除，此处锁定为开放访问。
+    vi.spyOn(apiUtils, "getCachedResponse").mockReturnValue(null);
+    const parseSpy = vi.fn().mockResolvedValue({ code: 200, msg: "ok" });
+    const handler = createApiHandler(parseSpy, { shouldCache: false });
+
+    const req = new Request("http://127.0.0.1/api/parse?url=https://v.douyin.com/gnrPF7GJYkY/");
+    const res = await handler(req);
+
+    expect(res.status).toBe(200);
+    expect(parseSpy).toHaveBeenCalledTimes(1);
   });
 
   it("allows non-blacklisted IP through (regression)", async () => {

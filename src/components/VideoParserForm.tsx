@@ -10,11 +10,8 @@ import {
   detectPlatform,
   hasValidVideoUrl,
 } from "@/utils/share";
-import { showWxAuth } from "@/lib/wx-auth-client";
-// 广告弹窗暂时下线：产品口径改为「完全放开让用户用」，弹窗相关代码先注释保留，
-// 恢复时取消下方注释（并恢复 countSuccessAndMaybePopup 定义与成功分支的调用）。
-// import { unlockByAd } from "@/lib/floating-unlock-client";
-// import { floatingUnlockConfig } from "@/config/floating-unlock";
+// 【改造说明】原解析前的强制微信认证弹窗（showWxAuth / window.WxAuth）已移除。
+// 解析入口不再依赖任何第三方登录 SDK，用户粘贴链接即可直接解析。
 import PlatformIcon from "@/components/PlatformIcon";
 import { toFrontendPlatform } from "@/utils/platform-map";
 
@@ -32,36 +29,9 @@ interface VideoParserFormProps {
 const CACHE_TTL = 5 * 60 * 1000;
 const CACHE_MAX = 20;
 
-// 广告提示弹窗（暂时下线，整段注释保留，恢复时取消注释即可）：
-// 每成功解析 freeQuota 次弹一次，纯前端行为、不阻断——弹窗看不看、关不关
-// 都不影响解析结果与后续使用。后端已无任何配额校验。
-// const POPUP_COUNTER_KEY = "parse:adPopupCount";
-// const POPUP_EVERY = floatingUnlockConfig.freeQuota;
-//
-// let popupCount = 0;
-// try {
-//   popupCount = parseInt(localStorage.getItem(POPUP_COUNTER_KEY) || "0", 10) || 0;
-// } catch {
-//   // localStorage 不可用（隐私模式等）：退化为内存计数
-// }
-//
-// // 成功解析后调用：累加计数，攒满一轮就 fire-and-forget 弹一次广告窗
-// function countSuccessAndMaybePopup(): void {
-//   popupCount += 1;
-//   try {
-//     localStorage.setItem(POPUP_COUNTER_KEY, String(popupCount));
-//   } catch {
-//     // 写不进就只用内存计数
-//   }
-//   if (popupCount < POPUP_EVERY) return;
-//   popupCount = 0;
-//   try {
-//     localStorage.setItem(POPUP_COUNTER_KEY, "0");
-//   } catch {
-//     // 同上
-//   }
-//   void unlockByAd().catch(() => {});
-// }
+// 【改造说明】原「激励视频广告弹窗」整段已随 floating-unlock 依赖一并移除
+// （该弹窗依赖作者的第三方小程序广告 SDK，与本项目自建部署的目标不符）。
+// 如需在免费额度用尽后插播广告，请接入自有广告平台并在此重新实现计数逻辑。
 
 // 读取缓存：命中且未过期返回数据，否则删除过期项
 function readCache(cacheKey: string): ApiResponse | null {
@@ -162,9 +132,8 @@ export default function VideoParserForm({
     async (url: string, platform: VideoPlatformKey | "auto", retryCount = 0) => {
       if (!url) return;
 
-      // 微信强制关注：每次发起解析都弹出（不可关闭），关注验证通过后才继续解析
-      const authed = await showWxAuth();
-      if (!authed) return; // 未完成关注则不发起解析（required=true 下理论上无法跳过）
+      // 【改造说明】此处原有 showWxAuth() 强制微信认证弹窗（每次解析都弹出，
+      // 未通过则不发起解析）。已移除：解析为开放能力，不再要求登录。
 
       const cacheKey = `${platform}:${url}`;
 

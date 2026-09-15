@@ -34,7 +34,7 @@ B站请求中继：海外服务器（新加坡）的 B站请求经本云函数�
 
 ## 二、主站配置
 
-服务器 `/opt/1panel/.../parse.shenzjd.com/index/.env` 增加两行：
+服务器 `/opt/1panel/.../parse.113826.xyz/index/.env` 增加两行：
 
 ```
 BILIBILI_RELAY_URL=https://<网关访问路径>
