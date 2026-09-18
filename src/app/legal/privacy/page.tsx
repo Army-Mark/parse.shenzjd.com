@@ -79,8 +79,15 @@ export default function PrivacyPage() {
 
       <h2>八、联系我们</h2>
       <p>
-        如对本政策有任何疑问或建议，请联系：
-        <a href={`mailto:${siteConfig.contactEmail}`}>{siteConfig.contactEmail}</a>
+        如对本政策有任何疑问或建议，
+        {siteConfig.contactEmail ? (
+          <>
+            请联系：
+            <a href={`mailto:${siteConfig.contactEmail}`}>{siteConfig.contactEmail}</a>
+          </>
+        ) : (
+          "请通过本站其他公开渠道联系运营者。"
+        )}
       </p>
     </LegalLayout>
   );

@@ -91,23 +91,14 @@ export default function RootLayout({
     <html lang="zh-CN" className="scroll-smooth">
       <head>
         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-        <link rel="icon" type="image/svg+xml" href="https://cdn.jsdmirror.com/gh/wu529778790/img.shenzjd.com@master/blog/imgx-20260828-215653-2ha5.svg" />
-        <link rel="apple-touch-icon" href="https://cdn.jsdmirror.com/gh/wu529778790/img.shenzjd.com@master/blog/imgx-20260828-220754-822r.png" />
-        {/* 右侧悬浮公众号+赞赏码浮窗：@wu529778790/floating-qr Web Component 版
-            一行 <script> 引入，自动注册 <floating-qr> 并注入默认浮窗（right-center，
-            默认隐藏移动端、关闭后刷新重现），无需额外标签/JS */}
-        <script
-          src="https://unpkg.com/@wu529778790/floating-qr@latest/dist/floating-qr.wc.js"
-          defer
-        />
-        {/* 顶部导航 + 头像浮窗：@wu529778790/site-navbar Web Component 版
-            一条 JS 引入，组件内部自动加载并初始化 wx-auth-sdk（静默校验登录态），
-            无需手动引 SDK、无需写 WxAuth.init()。body 顶部放一个 <site-navbar> 标签即出现整条导航。
-            解析主流程的登录弹窗由 src/lib/wx-auth-client.ts 复用同一全局 window.WxAuth 实例触发 */}
-        <script
-          src="https://unpkg.com/@wu529778790/site-navbar@latest/dist/site-navbar.wc.js"
-          defer
-        />
+        {/* 【改造说明】原页面在此引入作者托管在 unpkg 的两个 Web Component：
+            @wu529778790/floating-qr（公众号 + 赞赏码浮窗）与
+            @wu529778790/site-navbar（顶部导航，内部会自动初始化 third-party 微信
+            登录 SDK 并静默校验登录态）。二者均为 @latest 不锁版本的第三方脚本，
+            运行在自有域名下并持有 Cookie 写入能力，属于供应链风险与站外依赖，
+            已整体移除。图标改由本站 public/brand/ 提供，不再外链作者 CDN。 */}
+        <link rel="icon" type="image/svg+xml" href="/brand/logo-mark.svg" />
+        <link rel="apple-touch-icon" href="/brand/logo-mark.svg" />
         <script
           type="application/ld+json"
           dangerouslySetInnerHTML={{
@@ -127,7 +118,6 @@ export default function RootLayout({
         />
       </head>
       <body className="antialiased min-h-screen flex flex-col noise-overlay">
-        <site-navbar />
         <main className="flex-1">{children}</main>
         <Footer />
       </body>

@@ -1,0 +1,12 @@
+# 每次同步时无条件删除的路径（相对仓库根），按行分隔，# 开头为注释
+.github/workflows/sync-upstream.yml
+open-next.config.ts
+public/robots.txt
+public/sitemap.xml
+src/config/floating-unlock.ts
+src/lib/floating-unlock-client.ts
+src/lib/wx-auth-client.ts
+src/lib/wx-auth-guard.ts
+src/types/custom-elements.d.ts
+tests/wx-auth-guard.test.ts
+wrangler.toml

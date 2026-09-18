@@ -45,13 +45,21 @@ export default function DmcaPage() {
       </ol>
 
       <h2>三、联系方式</h2>
-      <p>请将完整的权利通知发送至：</p>
-      <p>
-        <strong>邮箱：</strong>
-        <a href={`mailto:${siteConfig.copyrightEmail}`}>
-          {siteConfig.copyrightEmail}
-        </a>
-      </p>
+      {siteConfig.copyrightEmail ? (
+        <>
+          <p>请将完整的权利通知发送至：</p>
+          <p>
+            <strong>邮箱：</strong>
+            <a href={`mailto:${siteConfig.copyrightEmail}`}>
+              {siteConfig.copyrightEmail}
+            </a>
+          </p>
+        </>
+      ) : (
+        <p>
+          本站为自建部署实例，未设置专门的权利通知邮箱，请通过本站其他公开渠道联系运营者。
+        </p>
+      )}
       <p>我们收到符合要求的通知后，会在合理期限内处理并回复。</p>
 
       <h2>四、处理说明</h2>

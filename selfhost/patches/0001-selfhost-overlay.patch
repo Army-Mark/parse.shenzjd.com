@@ -1,0 +1,3599 @@
+diff --git a/.env.example b/.env.example
+index 3eabc0f..6228d8c 100644
+--- a/.env.example
++++ b/.env.example
+@@ -1,11 +1,30 @@
+ # =========================================================
+-# 神族九帝 短视频解析站 - 环境变量示例
++# 短视频解析站 - 环境变量示例
+ # 用法：复制本文件为 .env 后按需填写；所有变量均可选（不配即有默认/自动禁用）。
++#
++# 本版本为「已剥离第三方微信认证」的自建版：原 WXAUTH_API_BASE 已废弃移除，
++# 解析接口不再要求登录。
+ # =========================================================
+ 
++# ---- 站点身份（可选；不配置时使用代码内默认值：口袋时光 / 113826.xyz）----
++# NEXT_PUBLIC_ 变量在构建期注入，须在 build / deploy 前设置好并重新构建才生效
++# NEXT_PUBLIC_SITE_NAME=口袋时光
++# NEXT_PUBLIC_SITE_DOMAIN=113826.xyz
++# NEXT_PUBLIC_SITE_URL=https://parse.113826.xyz
++# 联系邮箱默认留空（法律页会隐藏邮箱并显示中性提示）；需要展示时再填
++# NEXT_PUBLIC_CONTACT_EMAIL=
++# NEXT_PUBLIC_COPYRIGHT_EMAIL=
++
++# ---- 跨域放行（可选；不配则不返回 CORS 头，同源调用不受影响）----
++# 逗号分隔，支持子域，例：ALLOWED_ORIGINS=113826.xyz,parse.113826.xyz
++# ALLOWED_ORIGINS=
++
+ # ---- 抖音（提升解析成功率）----
+ # DOUYIN_COOKIE=your_cookie
+ 
++# ---- 微博（提升解析成功率）----
++# WEIBO_COOKIE=your_cookie
++
+ # ---- B站请求出口（海外服务器必须二选一，绕过 B站 IP 风控 -412）----
+ # 方式一：云函数中继（推荐，见 scf-bilibili-relay/README.md）
+ # BILIBILI_RELAY_URL=https://<函数公网URL>
+@@ -17,17 +36,14 @@
+ # ---- 解析行为统计（Turso/libsql；未配置时记录功能自动禁用）----
+ # TURSO_DB_URL=libsql://your-db.turso.io
+ # TURSO_AUTH_TOKEN=your_token
+-# 统计查看接口 /api/stats 复用微信登录态鉴权（仅管理员），无需额外配置 key
+-
+-# ---- 微信认证后端（默认 https://wx-auth.shenzjd.com，一般无需配置）----
+-# WXAUTH_API_BASE=https://wx-auth.shenzjd.com
++# /api/stats 只读统计接口的访问密钥（Bearer）。未配置则该接口返回 503 关闭。
++# 调用方式：curl -H "Authorization: Bearer <STATS_API_KEY>" https://你的域名/api/stats
++# 建议用 openssl rand -hex 32 生成
++# STATS_API_KEY=
+ 
+ # ---- TikTok yt-dlp（Docker 部署内已自带 yt-dlp，一般无需配置）----
+ # YTDLP_BIN=yt-dlp
+ # YTDLP_TIMEOUT_MS=25000
+ 
+-# ---- 站点 URL（默认 https://parse.shenzjd.com）----
+-# NEXT_PUBLIC_SITE_URL=https://parse.shenzjd.com
+-
+ # ---- 视频解析入口开关（/api/config 读取；值需为 "true" 才放开，默认关闭）----
+ # VIDEO_PARSE_ENABLED=true
+diff --git a/.gitattributes b/.gitattributes
+new file mode 100644
+index 0000000..845dc11
+--- /dev/null
++++ b/.gitattributes
+@@ -0,0 +1,23 @@
++# 行尾约定
++#
++# `*.patch` 必须保持 LF，**禁止任何行尾转换**。
++#
++# 原因：Windows 上 `core.autocrlf=true` 会在检出时把文本文件的 LF 转成 CRLF，
++# 于是 selfhost/patches/*.patch 在本地工作区变成 CRLF 文件；而 `git apply` 对行尾
++# 敏感，会以「patch failed / patch does not apply」大面积失败 —— 现象极具误导性：
++# 工作区明明是纯净的上游代码，补丁却应用不上。
++#
++# 仓库里的 blob 一直是 LF，所以 Linux CI（core.autocrlf=false）不受影响，
++# 问题只在 Windows 本地复现。`-text` 表示「不是文本」，git 不做任何 EOL 转换，
++# 检出内容与 blob 逐字节一致。
++#
++# 双保险：scripts/sync-upstream.mjs 与 scripts/verify-overlay.mjs 在应用补丁前
++# 还会主动剥掉 CR，兼容在加入本文件之前就已存在的检出。
++*.patch -text
++
++# delete.txt 由 scripts/export-overlay.mjs 以 LF 重写。若不做约定，Windows 上
++# core.autocrlf=true 会让「刚导出的工作区」与索引产生行尾差异，git status 报出
++# 伪修改 ` M selfhost/delete.txt`，进而触发 sync-upstream.mjs 的 ensureClean() 拦截
++# （表现为「明明没改，却说工作区不干净」）。`text eol=lf` 把 blob 与工作区都钉死为
++# LF，并保留文本属性（仍可正常 diff）。
++selfhost/delete.txt text eol=lf
+diff --git a/.github/workflows/deploy-to-docker.yaml b/.github/workflows/deploy-to-docker.yaml
+index db120dc..6892a3c 100644
+--- a/.github/workflows/deploy-to-docker.yaml
++++ b/.github/workflows/deploy-to-docker.yaml
+@@ -1,5 +1,18 @@
+ name: Test, build and deploy
+ 
++# 【自建改造】本服务器线上是 systemd 直跑 node（/opt/parse/app + server.js），
++# 与本工作流的 Docker 方案抢同一个 3000 端口，二者只能留一个。默认整体关闭：
++# 所有 job 都需要仓库变量 ENABLE_DOCKER_DEPLOY == 'true' 才执行，否则直接跳过。
++#
++# 为什么是「默认关闭」而不是删掉：
++#   1. 本工作流属于上游文件，每次同步都会被「固定为上一版本」，删掉又会被上游带回来，
++#      维护成本高；加一个开关更稳。
++#   2. 关闭后不再消耗 Actions 配额（每次同步 push 都会触发一次 Docker 构建并推 GHCR）。
++#
++# 想改用 Docker 部署：在 Settings → Secrets and variables → Actions → Variables 新建
++#   ENABLE_DOCKER_DEPLOY = true，并补齐 DEPLOY_HOST / DEPLOY_USER / DEPLOY_PASSWORD，
++#   同时停用 selfhost-sync.yml 里的 deploy 任务（否则两边同时抢端口）。
++
+ on:
+   push:
+     branches: [main]
+@@ -46,6 +59,8 @@ jobs:
+   test:
+     name: Run unit tests
+     runs-on: ubuntu-latest
++    # 默认关闭：改用 systemd 部署后这条 Docker 链路只在显式开启时才跑（见文件头说明）
++    if: vars.ENABLE_DOCKER_DEPLOY == 'true'
+     steps:
+       - name: Checkout
+         uses: actions/checkout@v4
+@@ -74,6 +89,7 @@ jobs:
+   build:
+     runs-on: ubuntu-latest
+     needs: [test]
++    if: vars.ENABLE_DOCKER_DEPLOY == 'true'
+     steps:
+       - name: Checkout
+         uses: actions/checkout@v4
+@@ -133,7 +149,8 @@ jobs:
+   deploy:
+     needs: build
+     runs-on: ubuntu-latest
+-    if: github.ref == 'refs/heads/main'
++    # 默认关闭；且仅 main 分支部署（见文件头说明）
++    if: github.ref == 'refs/heads/main' && vars.ENABLE_DOCKER_DEPLOY == 'true'
+     steps:
+       - name: Deploy to server
+         uses: appleboy/ssh-action@v1
+@@ -144,7 +161,14 @@ jobs:
+           script: |
+             IMAGE="ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]'):latest"
+             CONTAINER="${{ github.event.repository.name }}"
+-            ENV_FILE="/opt/1panel/apps/openresty/openresty/www/sites/parse.shenzjd.com/index/.env"
++            # 【改造说明】原路径硬编码作者服务器的站点目录，自建部署必须替换。
++            # 优先读取仓库变量 DEPLOY_ENV_FILE（Settings → Variables），
++            # 未配置时回退到应用目录下的 .env。
++            ENV_FILE="${{ vars.DEPLOY_ENV_FILE }}"
++            if [ -z "$ENV_FILE" ]; then ENV_FILE="/opt/parse/.env"; fi
++            # 宿主机映射端口同样可配，默认 3000
++            HOST_PORT="${{ vars.DEPLOY_PORT }}"
++            if [ -z "$HOST_PORT" ]; then HOST_PORT=3000; fi
+             sudo docker pull "$IMAGE"
+             sudo docker stop "$CONTAINER" || true
+             sudo docker rm "$CONTAINER" || true
+@@ -162,6 +186,6 @@ jobs:
+               --restart unless-stopped \
+               --init \
+               $ENV_FLAGS \
+-              -p 5269:3000 \
++              -p "${HOST_PORT}:3000" \
+               "$IMAGE"
+             sudo docker image prune -f
+diff --git a/.github/workflows/selfhost-sync.yml b/.github/workflows/selfhost-sync.yml
+new file mode 100644
+index 0000000..ef87324
+--- /dev/null
++++ b/.github/workflows/selfhost-sync.yml
+@@ -0,0 +1,451 @@
++name: Self-host sync (reapply overlay on upstream)
++
++# 作用：保留上游同步能力，同时保证本地「自建改造」不被上游覆盖。
++#
++# 机制（补丁栈重放）：
++#   1. 拉取上游最新代码
++#   2. 把工作区完全重置为上游（丢弃本地历史）
++#   3. 从本仓库上一个正常版本取回 selfhost/ 叠加层（补丁 + 删除清单）
++#   4. 在干净的上游代码上重新应用补丁、执行删除
++#   5. 运行不变量守卫 → 单元测试 → 生产构建 → 固定上游工作流文件
++#   6. 全部通过才提交并推送；任何一步失败即中止，线上保持上一个正常版本
++#
++# 为什么不直接用 merge：
++#   merge 对「不冲突」的改动会静默采纳上游版本。上游一旦在别处重新引入被剥离的
++#   第三方认证代码，merge 不会报冲突，改造会被悄悄抵消。重置 + 重放 + 守卫的组合
++#   让这种情况必须以「任务失败」的形式暴露，而不是静默退化。
++#
++# 关于 .github/workflows：
++#   GitHub 禁止用默认 GITHUB_TOKEN 推送任何工作流文件改动。因此本任务在提交前会把
++#   上游工作流文件固定为「上一个正常版本」，使本次推送在 .github/workflows 下没有
++#   任何差异（唯一的自有工作流 selfhost-sync.yml 内容也不变），默认 token 即可推送。
++#   代价：上游对工作流文件的改进不会自动生效；需要时用带 workflow 权限的 SYNC_TOKEN
++#   并把「Pin upstream workflow files」这一步删掉。
++#
++# 前置（一次性）：
++#   首次提交本工作流需要一个能写 .github/workflows 的凭据，请在本地用你自己的
++#   PAT / SSH 推送一次，之后每日同步即可全自动。
++#
++# 部署（jobs.deploy）：
++#   同步成功后把 standalone 产物推送到服务器并重启 systemd 服务，形成
++#   「上游更新 → GitHub → 服务器」全自动链路。用到的 Secrets / Variables 见
++#   selfhost/README.md「自动部署」一节；未配置任何 DEPLOY_* 时 deploy 任务会
++#   明确报错中止（不会静默跳过），避免误以为已经部署。
++#
++#   变更检测：只有 sync 真的产生了新提交（changed=true）才部署，上游没动就不做
++#   无谓的构建与重启 —— 重启服务会短暂中断线上解析。需要强制重部署（例如只改了
++#   服务器 .env）时用 workflow_dispatch 的 force_deploy。
++
++on:
++  schedule:
++    - cron: "0 3 * * *" # 每天 03:00 UTC（北京时间 11:00）
++  workflow_dispatch:
++    inputs:
++      force_deploy:
++        description: "即使代码无变化，也重新构建并部署到服务器"
++        type: boolean
++        default: false
++
++permissions:
++  contents: write
++
++concurrency:
++  group: selfhost-sync
++  cancel-in-progress: false
++
++env:
++  # 上游仓库（按需修改）
++  UPSTREAM_REPO: wu529778790/parse.shenzjd.com
++  UPSTREAM_BRANCH: main
++  # 本叠加层自有的工作流文件，不参与「固定上游工作流」步骤
++  OWN_WORKFLOW: .github/workflows/selfhost-sync.yml
++
++jobs:
++  sync:
++    runs-on: ubuntu-latest
++    # 只在本 fork 中运行；上游自身无需自同步，避免每天空跑
++    if: github.repository != 'wu529778790/parse.shenzjd.com'
++    outputs:
++      # 传给 deploy：只有真的产生了「覆盖上游的新提交」才需要动线上。
++      # 上游没人动 → changed=false → 不做无谓的构建与重启。
++      changed: ${{ steps.commit.outputs.changed }}
++      branch: ${{ steps.b.outputs.default }}
++    # 构建期注入：NEXT_PUBLIC_* 会被打进客户端产物，必须在 `npm run build` 之前设好。
++    # 全部取自仓库 Variables（Settings → Secrets and variables → Actions → Variables），
++    # 未配置时为空串，src/config/site.ts 会回退到本仓库内置的默认值。
++    env:
++      NEXT_PUBLIC_SITE_NAME: ${{ vars.NEXT_PUBLIC_SITE_NAME }}
++      NEXT_PUBLIC_SITE_DOMAIN: ${{ vars.NEXT_PUBLIC_SITE_DOMAIN }}
++      NEXT_PUBLIC_SITE_URL: ${{ vars.NEXT_PUBLIC_SITE_URL }}
++      NEXT_PUBLIC_COPYRIGHT_EMAIL: ${{ vars.NEXT_PUBLIC_COPYRIGHT_EMAIL }}
++      NEXT_PUBLIC_CONTACT_EMAIL: ${{ vars.NEXT_PUBLIC_CONTACT_EMAIL }}
++      # 稳定 buildId：next.config.mjs 的 generateBuildId 未指定时回退到 Date.now()，
++      # 会造成同一次部署的前后端 ID 不一致（RSC / Server Action 报「找不到 action」）。
++      NEXT_BUILD_ID: ${{ github.sha }}
++    steps:
++      - name: Checkout fork
++        uses: actions/checkout@v4
++        with:
++          fetch-depth: 0
++          # 有 SYNC_TOKEN 就用它（可推送工作流改动），否则用默认 token
++          token: ${{ secrets.SYNC_TOKEN || github.token }}
++
++      - name: Git identity
++        run: |
++          git config user.name  "github-actions[bot]"
++          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
++
++      - name: Resolve default branch
++        id: b
++        run: |
++          DEFAULT="${{ github.event.repository.default_branch }}"
++          if [ -z "$DEFAULT" ]; then DEFAULT=main; fi
++          echo "default=$DEFAULT" >> $GITHUB_OUTPUT
++          echo "默认分支: $DEFAULT"
++
++      - name: Fetch origin and upstream
++        run: |
++          set -e
++          git fetch --prune --tags origin "+refs/heads/*:refs/remotes/origin/*"
++          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" \
++            || git remote set-url upstream "https://github.com/${UPSTREAM_REPO}.git"
++          git fetch --prune --tags upstream \
++            "+refs/heads/${UPSTREAM_BRANCH}:refs/remotes/upstream/${UPSTREAM_BRANCH}"
++
++      - name: Remember last good overlay commit
++        id: last
++        run: |
++          set -e
++          SHA="$(git rev-parse "origin/${{ steps.b.outputs.default }}")"
++          echo "sha=$SHA" >> $GITHUB_OUTPUT
++          echo "上一个正常版本: $SHA"
++          git log -1 --format='  %h %s' "$SHA"
++
++      - name: Stash overlay aside
++        # 叠加层必须取自「上一个正常版本」：紧接着要把工作区重置为上游，
++        # 重置会把 selfhost/ 一并删除。scripts/ 由补丁负责重建，这里不取，
++        # 否则会与补丁里的「新增文件」冲突。
++        run: |
++          set -e
++          rm -rf /tmp/selfhost-overlay
++          mkdir -p /tmp/selfhost-overlay
++          if ! git cat-file -e "${{ steps.last.outputs.sha }}:selfhost/delete.txt" 2>/dev/null; then
++            echo "::error::上一个版本中不存在 selfhost/delete.txt，叠加层不完整，请先本地导出并推送一次"
++            exit 1
++          fi
++          git archive "${{ steps.last.outputs.sha }}" selfhost | tar -x -C /tmp/selfhost-overlay
++          echo "取回叠加层："
++          find /tmp/selfhost-overlay -type f | sed 's|/tmp/selfhost-overlay/||' | sort
++
++      - name: Reset working tree to upstream
++        run: |
++          set -e
++          git checkout -B "${{ steps.b.outputs.default }}" "upstream/${UPSTREAM_BRANCH}"
++          echo "工作区已重置为上游 $(git rev-parse --short HEAD)"
++
++      - name: Restore overlay files
++        run: |
++          set -e
++          cp -r /tmp/selfhost-overlay/selfhost ./selfhost
++          test -s selfhost/delete.txt || { echo "::error::selfhost/delete.txt 为空或缺失"; exit 1; }
++
++      - name: Reapply overlay patches
++        run: |
++          set -e
++          shopt -s nullglob
++          patches=(selfhost/patches/*.patch)
++          if [ ${#patches[@]} -eq 0 ]; then
++            echo "::error::selfhost/patches 下没有补丁，无法重建自建改造"
++            exit 1
++          fi
++          for p in "${patches[@]}"; do
++            echo "== 应用 $p"
++            if ! git apply --3way --whitespace=nowarn "$p"; then
++              echo "::error file=$p::补丁应用失败：上游改动与本地改造冲突"
++              echo "---- 冲突文件 ----"
++              git diff --name-only --diff-filter=U || true
++              echo "---- 冲突详情（前 200 行）----"
++              git diff | head -200 || true
++              exit 1
++            fi
++          done
++          echo "补丁全部应用完成"
++
++      - name: Apply deletions
++        # 删除用 git rm 而非补丁：对上游的任何改动都免疫，不会造成冲突
++        run: |
++          set -e
++          while IFS= read -r line; do
++            case "$line" in ''|'#'*) continue ;; esac
++            if [ -e "$line" ] || git ls-files --error-unmatch "$line" >/dev/null 2>&1; then
++              echo "删除 $line"
++              git rm -rf -q -f --ignore-unmatch -- "$line"
++            else
++              echo "跳过（已不存在）$line"
++            fi
++          done < selfhost/delete.txt
++
++      - name: Pin upstream workflow files
++        # 让 .github/workflows 下除本叠加层自有工作流外，内容与本仓库上一个版本完全一致，
++        # 从而本次推送不构成「工作流文件改动」，默认 GITHUB_TOKEN 也可以推送。
++        run: |
++          set -e
++          LAST="${{ steps.last.outputs.sha }}"
++          # 1) 上游新增的工作流文件：本次不引入（保持与上一版本一致的集合）
++          while IFS= read -r f; do
++            [ -z "$f" ] && continue
++            [ "$f" = "${OWN_WORKFLOW}" ] && continue
++            if ! git cat-file -e "$LAST:$f" 2>/dev/null; then
++              echo "移除上游新增工作流: $f"
++              rm -f "$f"
++              git rm -q -f --ignore-unmatch -- "$f" 2>/dev/null || true
++            fi
++          done < <(git ls-files .github/workflows)
++          # 2) 其余工作流文件：固定为上一版本的内容
++          while IFS= read -r f; do
++            [ -z "$f" ] && continue
++            [ "$f" = "${OWN_WORKFLOW}" ] && continue
++            echo "固定工作流为上个版本: $f"
++            git show "$LAST:$f" > "$f"
++          done < <(git ls-tree -r --name-only "$LAST" -- .github/workflows | grep -v "^${OWN_WORKFLOW}$" || true)
++
++      - name: Guard self-host invariants
++        run: node scripts/selfhost-guard.mjs
++
++      - name: Setup Node.js
++        uses: actions/setup-node@v4
++        with:
++          node-version: 24
++          cache: "npm"
++
++      - name: Reconcile lockfile with patched package.json
++        # package-lock.json 不进入补丁 —— 锁文件是派生产物，上游每次依赖升降级都会
++        # 重写它，放进补丁会让三方合并频繁冲突（详见 scripts/export-overlay.mjs）。
++        # 代价是：应用补丁后 package.json 可能与上游锁文件不再一致（本地移除了
++        # @opennextjs/cloudflare）。故此处按 package.json 重新生成锁文件，
++        # 使随后的 `npm ci` 同步校验可以通过。改动会由 Commit 步骤一并提交。
++        run: npm install --package-lock-only --ignore-scripts --no-audit --no-fund
++
++      - name: Verify (install + test + build)
++        run: |
++          npm ci
++          npm test
++          npm run build
++
++      - name: Package standalone bundle
++        # Next.js 的 standalone 产物**不含** .next/static 与 public，必须显式补进去，
++        # 否则线上页面无样式、无图标 —— 这是 standalone 部署最常见的坑。
++        run: |
++          set -e
++          STAGE=/tmp/parse-bundle
++          rm -rf "$STAGE"
++          mkdir -p "$STAGE"
++          cp -r .next/standalone/. "$STAGE/"
++          mkdir -p "$STAGE/.next/static"
++          cp -r .next/static/. "$STAGE/.next/static/"
++          if [ -d public ]; then
++            mkdir -p "$STAGE/public"
++            cp -r public/. "$STAGE/public/"
++          fi
++          # 缺任何一项都会让服务起不来或页面错乱，这里前置校验，宁可失败也不上线半成品
++          test -f "$STAGE/server.js"
++          test -d "$STAGE/node_modules"
++          test -d "$STAGE/.next/static"
++          test -s "$STAGE/.next/BUILD_ID"
++          # 落一个可读标记，部署端据此确认拿到的是本次构建
++          printf '%s\n' "$(cat .next/BUILD_ID)" > "$STAGE/BUILD_ID.txt"
++          tar -czf /tmp/parse-bundle.tar.gz -C "$STAGE" .
++          ls -lh /tmp/parse-bundle.tar.gz
++          echo "BUILD_ID=$(cat .next/BUILD_ID)"
++
++      - name: Upload bundle artifact
++        uses: actions/upload-artifact@v4
++        with:
++          name: parse-standalone
++          path: /tmp/parse-bundle.tar.gz
++          retention-days: 3
++          if-no-files-found: error
++
++      - name: Commit overlay
++        id: commit
++        run: |
++          set -e
++          git add -A
++          if git diff --cached --quiet; then
++            echo "changed=false" >> $GITHUB_OUTPUT
++            echo "与上游无差异，无需提交"
++          else
++            SHORT="$(git rev-parse --short "upstream/${UPSTREAM_BRANCH}")"
++            git commit -q -m "chore(selfhost): reapply overlay on upstream ${SHORT}"
++            echo "changed=true" >> $GITHUB_OUTPUT
++            git --no-pager diff --stat "upstream/${UPSTREAM_BRANCH}" HEAD | tail -30
++          fi
++
++      - name: Push
++        if: steps.commit.outputs.changed == 'true'
++        run: |
++          set -e
++          git push --force-with-lease origin "HEAD:${{ steps.b.outputs.default }}"
++
++  # ---------------------------------------------------------------------------
++  # 部署到服务器（systemd）
++  #
++  # 为什么必须放在同一个工作流里、而不是靠 deploy-to-docker.yaml 的 push 触发：
++  #   用默认 GITHUB_TOKEN 提交的推送**不会**触发其他工作流（GitHub 的反递归保护），
++  #   所以 sync 推完代码后，监听 push 的部署工作流根本不会启动。要么写在同一个
++  #   工作流里用 needs 串起来，要么用 PAT 推送 —— 这里选前者，少一个长期凭据。
++  #
++  # 为什么不用 Docker：本服务器线上是 systemd + node 直跑（/opt/parse/app + server.js），
++  #   Docker 路径会去抢同一个 3000 端口。两者只能留一个，这里与线上保持一致。
++  # ---------------------------------------------------------------------------
++  deploy:
++    name: Deploy to server (systemd)
++    needs: sync
++    runs-on: ubuntu-latest
++    # 上游仓库自身不部署；只有真产生了新提交（changed=true）才动线上，
++    # 避免每天空跑一次构建 + 重启（重启会短暂中断线上解析）。
++    # 手动触发时可勾选 force_deploy 忽略变更检测强制重部署。
++    if: >-
++      github.repository != 'wu529778790/parse.shenzjd.com'
++      && (needs.sync.outputs.changed == 'true' || inputs.force_deploy == true)
++    steps:
++      - name: Download bundle
++        uses: actions/download-artifact@v4
++        with:
++          name: parse-standalone
++          path: ./bundle
++
++      - name: Check deploy configuration
++        env:
++          HOST: ${{ secrets.DEPLOY_HOST }}
++          USER: ${{ secrets.DEPLOY_USER }}
++          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
++        run: |
++          set -e
++          missing=""
++          [ -n "$HOST" ] || missing="$missing DEPLOY_HOST"
++          [ -n "$USER" ] || missing="$missing DEPLOY_USER"
++          [ -n "$KEY" ] || missing="$missing DEPLOY_SSH_KEY"
++          if [ -n "$missing" ]; then
++            echo "::error::缺少部署配置:$missing —— 请在 Settings → Secrets and variables → Actions 中补齐，参考 selfhost/README.md「自动部署」。"
++            exit 1
++          fi
++          echo "部署目标: $USER@$HOST"
++
++      - name: Set up SSH
++        env:
++          KEY: ${{ secrets.DEPLOY_SSH_KEY }}
++          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
++          HOST: ${{ secrets.DEPLOY_HOST }}
++          PORT: ${{ secrets.DEPLOY_PORT || 22 }}
++        run: |
++          set -e
++          mkdir -p ~/.ssh
++          printf '%s\n' "$KEY" > ~/.ssh/deploy_key
++          chmod 600 ~/.ssh/deploy_key
++          if [ -n "$KNOWN_HOSTS" ]; then
++            printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
++          else
++            # 未提供固定指纹时退化为首次扫描：方便但有中间人风险。
++            # 生产环境建议把 `ssh-keyscan -p <端口> <主机>` 的输出存成 DEPLOY_KNOWN_HOSTS。
++            ssh-keyscan -p "$PORT" "$HOST" > ~/.ssh/known_hosts 2>/dev/null
++          fi
++          chmod 600 ~/.ssh/known_hosts
++
++      - name: Upload bundle to server
++        env:
++          HOST: ${{ secrets.DEPLOY_HOST }}
++          USER: ${{ secrets.DEPLOY_USER }}
++          PORT: ${{ secrets.DEPLOY_PORT || 22 }}
++          TMP_DIR: ${{ vars.DEPLOY_TMP_DIR || '/tmp' }}
++        run: |
++          set -e
++          scp -P "$PORT" -i ~/.ssh/deploy_key \
++            -o IdentitiesOnly=yes -o BatchMode=yes \
++            bundle/parse-bundle.tar.gz "${USER}@${HOST}:${TMP_DIR}/parse-bundle.tar.gz"
++
++      - name: Apply on server and restart service
++        env:
++          HOST: ${{ secrets.DEPLOY_HOST }}
++          USER: ${{ secrets.DEPLOY_USER }}
++          PORT: ${{ secrets.DEPLOY_PORT || 22 }}
++          APP_DIR: ${{ vars.DEPLOY_APP_DIR }}
++          SERVICE: ${{ vars.DEPLOY_SERVICE }}
++          OWNER: ${{ vars.DEPLOY_OWNER }}
++          TMP_DIR: ${{ vars.DEPLOY_TMP_DIR || '/tmp' }}
++          HEALTH_URL: ${{ vars.DEPLOY_HEALTH_URL }}
++        run: |
++          set -e
++          ssh -p "$PORT" -i ~/.ssh/deploy_key \
++            -o IdentitiesOnly=yes -o BatchMode=yes \
++            -o ServerAliveInterval=15 -o ServerAliveCountMax=4 \
++            "${USER}@${HOST}" \
++            "APP_DIR='${APP_DIR}' SERVICE='${SERVICE}' OWNER='${OWNER}' TMP_DIR='${TMP_DIR}' HEALTH_URL='${HEALTH_URL}' bash -s" <<'REMOTE'
++          set -euo pipefail
++          APP_DIR="${APP_DIR:-/opt/parse/app}"
++          SERVICE="${SERVICE:-parse}"
++          OWNER="${OWNER:-parse}"
++          TMP_DIR="${TMP_DIR:-/tmp}"
++          HEALTH_URL="${HEALTH_URL:-http://127.0.0.1:3000/}"
++          PARENT="$(dirname "$APP_DIR")"
++
++          # 写 $APP_DIR 与重启 systemd 都需要 root：root 直连，或用免密 sudo。
++          if [ "$(id -u)" -eq 0 ]; then SUDO=""
++          elif sudo -n true 2>/dev/null; then SUDO="sudo"
++          else
++            echo "错误：部署用户既非 root 也没有免密 sudo，无法写入 $APP_DIR 或重启 $SERVICE" >&2
++            exit 1
++          fi
++
++          BUNDLE="$TMP_DIR/parse-bundle.tar.gz"
++          [ -s "$BUNDLE" ] || { echo "错误：服务器上不存在 $BUNDLE" >&2; exit 1; }
++          OLD_ID="$(cat "$APP_DIR/.next/BUILD_ID" 2>/dev/null || echo unknown)"
++
++          # 先解到暂存目录并校验，再整体替换：直接往运行目录解包会让服务在被访问时
++          # 处于「一半旧一半新」的状态
++          STAGE="$PARENT/.stage.$$"
++          $SUDO rm -rf "$STAGE"
++          $SUDO mkdir -p "$STAGE"
++          $SUDO tar -xzf "$BUNDLE" -C "$STAGE"
++          [ -f "$STAGE/server.js" ] || { echo "错误：产物缺少 server.js" >&2; exit 1; }
++          [ -d "$STAGE/.next/static" ] || { echo "错误：产物缺少 .next/static" >&2; exit 1; }
++          NEW_ID="$(cat "$STAGE/.next/BUILD_ID" 2>/dev/null || echo unknown)"
++          echo "BUILD_ID: $OLD_ID -> $NEW_ID"
++
++          BACKUP="$PARENT/.backup.prev"
++          $SUDO rm -rf "$BACKUP"
++          if [ -d "$APP_DIR" ]; then $SUDO mv "$APP_DIR" "$BACKUP"; fi
++          $SUDO mv "$STAGE" "$APP_DIR"
++          $SUDO chown -R "$OWNER:$OWNER" "$APP_DIR"
++          # 站点配置在 $PARENT/.env（systemd EnvironmentFile 读取），不在本站目录内，
++          # 因此整目录替换不会覆盖服务器上的环境变量
++          $SUDO rm -f "$BUNDLE"
++
++          $SUDO systemctl restart "$SERVICE"
++
++          ok=0
++          for i in $(seq 1 20); do
++            sleep 3
++            code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$HEALTH_URL" 2>/dev/null || echo 000)"
++            if [ "$code" = "200" ]; then ok=1; echo "健康检查通过（第 ${i} 次，HTTP $code）"; break; fi
++            echo "  第 ${i} 次未通过（HTTP $code）"
++          done
++
++          # 健康检查不通过就回滚：线上宁可是上一个正常版本，也不要一个起不来的新版本
++          if [ "$ok" != "1" ]; then
++            echo "健康检查失败，回滚到上一版本" >&2
++            $SUDO rm -rf "$APP_DIR"
++            if [ -d "$BACKUP" ]; then
++              $SUDO mv "$BACKUP" "$APP_DIR"
++              $SUDO systemctl restart "$SERVICE"
++              sleep 3
++              echo "已回滚，恢复后状态：$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "$HEALTH_URL" 2>/dev/null || echo 000)" >&2
++            fi
++            echo "---- $SERVICE 最近日志 ----" >&2
++            $SUDO journalctl -u "$SERVICE" -n 40 --no-pager >&2 || true
++            exit 1
++          fi
++
++          $SUDO rm -rf "$BACKUP"
++          echo "部署完成：$APP_DIR（BUILD_ID $NEW_ID）"
++          REMOTE
+diff --git a/.gitignore b/.gitignore
+index 5fe87fa..118370f 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -17,9 +17,6 @@
+ /.next/
+ /out/
+ 
+-# OpenNext Cloudflare 构建产物（push 由 CI 构建生成）
+-/.open-next/
+-
+ # production
+ /build
+ 
+@@ -61,4 +58,3 @@ next-env.d.ts
+ 
+ # 本地 AI 助手个人配置（每台机器不同，不进版本库）
+ .claude/settings.local.json
+-.wrangler/
+diff --git a/API.md b/API.md
+index 3eee2b1..17ad2f1 100644
+--- a/API.md
++++ b/API.md
+@@ -4,7 +4,7 @@
+ 
+ ## 基础信息
+ 
+-- **Base URL**: `https://parse.shenzjd.com` 或本地 `http://localhost:3000`
++- **Base URL**: `https://parse.113826.xyz` 或本地 `http://localhost:3000`
+ - **响应格式**: JSON
+ - **跨域支持**: 所有接口均支持 CORS
+ 
+@@ -460,7 +460,8 @@ STATS_API_KEY=your_stats_key
+ # VIDEO_PARSE_ENABLED=true
+ ```
+ 
+-> Cloudflare Workers 部署时：`BILIBILI_USER_AGENT` 已写入 `wrangler.toml` 的 `[vars]`；Cookie 类敏感值在 CI 中由 GitHub Secrets 自动 `wrangler secret put` 注入，无需手动配置。
++> 【自建改造】自建版仅支持 Docker / 服务器部署：敏感值（`DOUYIN_COOKIE`、`WEIBO_COOKIE`、`TURSO_AUTH_TOKEN`、`STATS_API_KEY` 等）统一写入宿主机 `.env`，由 `docker run --env-file` 注入，无需任何云端控制台配置。
++> `BILIBILI_USER_AGENT` 是代码内常量（见 `src/lib/bilibili-fetch.js`），不通过环境变量配置。
+ 
+ ---
+ 
+@@ -498,8 +499,8 @@ if (data.code === 200) {
+ 
+ ```bash
+ # 抖音解析
+-curl "https://parse.shenzjd.com/api/douyin?url=https://v.douyin.com/xxx/"
++curl "https://parse.113826.xyz/api/douyin?url=https://v.douyin.com/xxx/"
+ 
+ # 健康检查
+-curl "https://parse.shenzjd.com/api/health"
++curl "https://parse.113826.xyz/api/health"
+ ```
+diff --git a/CLAUDE.md b/CLAUDE.md
+index b6e1cb5..87b5f73 100644
+--- a/CLAUDE.md
++++ b/CLAUDE.md
+@@ -33,7 +33,9 @@ export const GET = createApiHandler(douyin);
+ 
+ Platform routes are **externally blocked** — `createApiHandler()` (in `src/lib/api-middleware.ts`) returns 403 for every route in its `ROUTE_DOMAIN_MAP` except `/api/parse`; they exist as shells for possible future re-exposure. The unified entry `/api/parse` does NOT forward over HTTP: it resolves parsers via `getPlatformParser()` (`src/lib/platformRoutes.js`, lazy `import()` of the lib modules) and calls the function directly. Never reintroduce an internal-forwarding marker header — a client-forgeable header (`x-parse-internal`) once bypassed auth/quota/analytics.
+ 
+-`createApiHandler()` wraps the unified entry with: WeChat auth guard (wxauth-token cookie / Bearer → remote check via wx-auth, 5-min per-token cache), free-quota + ad-unlock gate (in-memory, single-process only), IP-based rate limiting (60 req/min, in-memory), URL validation, SSRF protection, honeypot for blacklisted IPs, CORS, and error handling. `/api/parse` passes `sharedCache` — a 24-hour result cache (`src/lib/result-cache.js`; Cloudflare Cache API on Workers, in-memory Map fallback on Node) storing the normalized result; on hit it probes the direct URL and re-parses when the cached link is definitively dead (404/410). All routes run on Node.js runtime.
++`createApiHandler()` wraps the unified entry with: IP-based rate limiting (60 req/min, in-memory), URL validation, SSRF protection, honeypot for blacklisted IPs, CORS, and error handling. `/api/parse` passes `sharedCache` — a 24-hour result cache (`src/lib/result-cache.js`; Cloudflare Cache API on Workers, in-memory Map fallback on Node) storing the normalized result; on hit it probes the direct URL and re-parses when the cached link is definitively dead (404/410). All routes run on Node.js runtime.
++
++> **认证已移除（本分支改造）**：`createApiHandler()` 原来的「微信认证守卫」（读取 `wxauth-token` Cookie / `Authorization: Bearer`，再远程调用第三方 `wx-auth.113826.xyz/api/auth/check` 校验，未通过返回 401）以及「免费配额 + 广告解锁门禁」均已删除，同时删除了前端 `wx-auth-client.ts`、服务端 `wx-auth-guard.ts`、`floating-unlock-*` 与页面内引入的作者 unpkg 组件（`site-navbar` / `floating-qr`）。解析接口现为开放访问，防护仅由 rate limit、IP 黑名单蜜罐与 URL/SSRF 校验承担。**不要重新引入对第三方认证服务的调用**；如确需登录能力，请接入自建认证服务。CORS 放行名单改由环境变量 `ALLOWED_ORIGINS` 控制（逗号分隔，未配置则不放行跨域）。`/api/stats` 改用 `Authorization: Bearer <STATS_API_KEY>` 鉴权，未配置时返回 503。
+ 
+ Analytics (`src/lib/analytics.js`) buffers parse events in memory and batch-flushes them to Turso (20 events or 30s, one pipeline request); `queryStats()` caches its full-table aggregation for 5 minutes — do not reintroduce per-request DB writes/reads.
+ 
+@@ -73,3 +75,7 @@ Configure in `.env` for full functionality:
+ ## Deployment
+ 
+ Three targets: Vercel (one-click), Cloudflare Workers (`wrangler.toml`), Docker (GHCR + Docker Hub via GitHub Actions). The Docker CI workflow runs unit tests before building.
++
++> 【自建改造】本 fork 的部署目标已收敛为 **Docker / 自建服务器**（`Dockerfile` + `.github/workflows/deploy-to-docker.yaml`）。
++> Cloudflare 专用件（`wrangler.toml`、`open-next.config.ts`、`npm run build:cf`、`@opennextjs/cloudflare`）**已删除，不要重新引入**；
++> 上游同步任务会由 `scripts/selfhost-guard.mjs` 拦住回退。
+diff --git a/docs/parse-接口返回-小程序端.md b/docs/parse-接口返回-小程序端.md
+index 8e54b76..273975a 100644
+--- a/docs/parse-接口返回-小程序端.md
++++ b/docs/parse-接口返回-小程序端.md
+@@ -257,7 +257,7 @@ B站、抖音合集返回 `data.videos` 列表：
+ ```js
+ // 1. 请求
+ const res = await wx.request({
+-  url: 'https://parse.shenzjd.com/api/parse',
++  url: 'https://parse.113826.xyz/api/parse',
+   data: { url: shareUrl }
+ });
+ 
+diff --git a/docs/小程序接入抖音解析接口话术.md b/docs/小程序接入抖音解析接口话术.md
+index 5084056..5761199 100644
+--- a/docs/小程序接入抖音解析接口话术.md
++++ b/docs/小程序接入抖音解析接口话术.md
+@@ -10,10 +10,10 @@
+ 
+ ### 1. 接口信息
+ 
+-- **接口地址**：`GET https://parse.shenzjd.com/api/parse`（**统一解析入口**，所有平台共用，抖音直播/视频/合集都走这个）
++- **接口地址**：`GET https://parse.113826.xyz/api/parse`（**统一解析入口**，所有平台共用，抖音直播/视频/合集都走这个）
+ - **请求参数**（query string）：
+   - `url`：必填，抖音分享链接（支持短链 `v.douyin.com/xxx`、完整链接、直播链接、合集链接）
+-- **认证要求**：该接口需要微信认证。请求时需携带 `wxauth-token` Cookie（由 `wx-auth-sdk` 写入）。未认证时返回 `401`，提示「请先关注公众号并完成认证」。小程序端需先完成微信认证流程，拿到 token 后随请求带上。
++- **认证要求**：无。本自建版已移除第三方微信认证门禁，直接请求 `/api/parse` 即可，请勿再携带已废弃的 `wxauth-token`（携带也不会被校验）。由于接口为开放访问，建议在自有网关或 Cloudflare WAF 层补充来源白名单与频率限制。
+ - **说明**：`/api/parse` 是统一入口，会自动识别链接属于哪个平台（抖音/快手/B站等）并转发到对应解析器。抖音直播链接（`v.douyin.com` 短链）会被自动识别为抖音直播并返回直播流，**无需单独调 `/api/douyin`**。
+ 
+ ### 2. 返回结构（统一契约）
+diff --git a/package.json b/package.json
+index f4da72e..570a593 100644
+--- a/package.json
++++ b/package.json
+@@ -7,6 +7,9 @@
+   "author": "",
+   "license": "ISC",
+   "private": true,
++  "engines": {
++    "node": ">=22.19.0"
++  },
+   "scripts": {
+     "dev": "next dev --turbopack",
+     "build": "next build",
+@@ -15,7 +18,11 @@
+     "test": "vitest run",
+     "test:live": "RUN_LIVE_PARSE=1 vitest run tests/live/douyin-note.test.ts tests/live/xhs-note.test.ts tests/live/bilibili-note.test.ts tests/live/qsmusic-note.test.ts tests/live/weibo-note.test.ts tests/live/twitter-note.test.ts",
+     "test:watch": "vitest",
+-    "build:cf": "opennextjs-cloudflare build"
++    "selfhost:export": "node scripts/export-overlay.mjs",
++    "selfhost:guard": "node scripts/selfhost-guard.mjs",
++    "selfhost:verify": "node scripts/verify-overlay.mjs",
++    "selfhost:sync": "node scripts/sync-upstream.mjs",
++    "rebrand": "node scripts/rebrand.mjs"
+   },
+   "dependencies": {
+     "@ducanh2912/next-pwa": "^10.2.9",
+@@ -26,7 +33,6 @@
+   },
+   "devDependencies": {
+     "@eslint/eslintrc": "^3",
+-    "@opennextjs/cloudflare": "^1.20.2",
+     "@types/node": "^20",
+     "@types/react": "^19",
+     "@types/react-dom": "^19",
+diff --git a/public/manifest.webmanifest b/public/manifest.webmanifest
+index 31a1193..3444191 100644
+--- a/public/manifest.webmanifest
++++ b/public/manifest.webmanifest
+@@ -1,6 +1,6 @@
+ {
+-  "name": "神族九帝 短视频解析",
+-  "short_name": "神族九帝",
++  "name": "短视频解析",
++  "short_name": "视频解析",
+   "description": "支持抖音、快手、B站、微博、小红书等 24+ 平台的短视频解析与下载工具",
+   "start_url": "/",
+   "display": "standalone",
+@@ -8,13 +8,13 @@
+   "theme_color": "#0b0b14",
+   "icons": [
+     {
+-      "src": "https://cdn.jsdmirror.com/gh/wu529778790/img.shenzjd.com@master/blog/imgx-20260828-220754-822r.png",
++      "src": "/brand/logo-mark.png",
+       "sizes": "1024x1024",
+       "type": "image/png",
+       "purpose": "any"
+     },
+     {
+-      "src": "https://cdn.jsdmirror.com/gh/wu529778790/img.shenzjd.com@master/blog/imgx-20260828-221314-evqf.svg",
++      "src": "/brand/icon-512-maskable.svg",
+       "sizes": "any",
+       "type": "image/svg+xml",
+       "purpose": "maskable"
+diff --git a/scf-bilibili-relay/README.md b/scf-bilibili-relay/README.md
+index ac7ee9d..fad11f0 100644
+--- a/scf-bilibili-relay/README.md
++++ b/scf-bilibili-relay/README.md
+@@ -34,7 +34,7 @@ B站请求中继：海外服务器（新加坡）的 B站请求经本云函数
+ 
+ ## 二、主站配置
+ 
+-服务器 `/opt/1panel/.../parse.shenzjd.com/index/.env` 增加两行：
++服务器 `/opt/1panel/.../parse.113826.xyz/index/.env` 增加两行：
+ 
+ ```
+ BILIBILI_RELAY_URL=https://<网关访问路径>
+diff --git a/scf-bilibili-relay/package.json b/scf-bilibili-relay/package.json
+index a32edcb..bbc51a1 100644
+--- a/scf-bilibili-relay/package.json
++++ b/scf-bilibili-relay/package.json
+@@ -1,7 +1,7 @@
+ {
+   "name": "bilibili-relay",
+   "version": "1.1.0",
+-  "description": "B站请求中继（腾讯云函数事件函数），供 parse.shenzjd.com 海外服务器转发 B站 API 请求",
++  "description": "B站请求中继（腾讯云函数事件函数），供 parse.113826.xyz 海外服务器转发 B站 API 请求",
+   "main": "index.js",
+   "dependencies": {},
+   "license": "MIT",
+diff --git a/scripts/export-overlay.mjs b/scripts/export-overlay.mjs
+new file mode 100644
+index 0000000..0675f54
+--- /dev/null
++++ b/scripts/export-overlay.mjs
+@@ -0,0 +1,227 @@
++#!/usr/bin/env node
++/**
++ * 导出自建改造叠加层（overlay）
++ *
++ * 背景：本仓库是上游开源项目的 fork。自建改造以「补丁栈 + 删除清单」的形式保存，
++ * 每日由 .github/workflows/selfhost-sync.yml 重置到上游后重新叠加，从而既保留
++ * 上游同步能力，又不会被上游覆盖。
++ *
++ * 本脚本把「当前工作区相对上游 HEAD 的全部本地改动」导出为：
++ *   selfhost/patches/*.patch   修改与新增（不含删除）
++ *   selfhost/delete.txt        需要删除的文件清单
++ *
++ * 为什么把删除单独拆出来：删除用 `git rm -f --ignore-unmatch` 执行，对上游的任何
++ * 改动都免疫。若把删除写进 patch，上游只要改了这些文件（例如 CI 工作流几乎天天改），
++ * --3way 就会冲突并让整个同步任务失败。
++ *
++ * 用法：
++ *   node scripts/export-overlay.mjs            # 导出
++ *   node scripts/export-overlay.mjs --dry-run  # 只看会导出什么，不写文件
++ *
++ * 何时运行：任何一次本地改动之后（改了源码、改了工作流、加了脚本），
++ * 都要重新运行本脚本，否则同步任务用的是旧补丁，你的新改动会被上游重置掉。
++ */
++
++import { execFileSync } from "node:child_process";
++import { writeFile, mkdir, readdir, rm } from "node:fs/promises";
++import { existsSync, readFileSync } from "node:fs";
++import path from "node:path";
++import { fileURLToPath } from "node:url";
++import { resolveBase as resolveBaseShared, fallbackWarning, degradedWarning } from "./lib/selfhost-base.mjs";
++
++const ROOT = path.resolve(path.join(path.dirname(fileURLToPath(import.meta.url)), ".."));
++const OVERLAY_DIR = path.join(ROOT, "selfhost");
++const PATCH_DIR = path.join(OVERLAY_DIR, "patches");
++const DELETE_FILE = path.join(OVERLAY_DIR, "delete.txt");
++
++/** 叠加层自身的路径，绝不进入补丁（否则补丁会包含/改写自己） */
++const OVERLAY_PATHS = ["selfhost"];
++
++/**
++ * 派生产物，不进入补丁。
++ *
++ * package-lock.json：锁文件是**派生**文件，不该参与合并。两条理由——
++ *   ① 上游几乎每次依赖升降级都会重写它，放进补丁会让同步任务在 `--3way` 阶段
++ *      频繁冲突，而冲突意味着整次同步中止；
++ *   ② 它体量大，仅「移除一个依赖子树」就产生近 1MB 的 diff，而它本身对代码语义
++ *      没有增量信息。
++ * 正确做法：同步任务在应用补丁后用 `npm install --package-lock-only` 依据
++ * package.json 重新生成锁文件（见 .github/workflows/selfhost-sync.yml）。
++ */
++const DERIVED_PATHS = ["package-lock.json"];
++
++/**
++ * 差异基线：相对「上游」而非 HEAD（详见 scripts/lib/selfhost-base.mjs）。
++ *
++ * 踩过的坑：本脚本原先是 `git diff`（工作区 vs 索引），只在本仓库「HEAD 恰等于上游、
++ * 改动全部未提交」时成立。一旦把改造提交掉（同步前置条件要求工作区干净，所以提交
++ * 必然发生），`git diff` 什么都不剩 —— 导出会**静默清空叠加层**（补丁缩到几百字节、
++ * delete.txt 变成 0 项），下次同步就把上游代码原样贴回，改造全部丢失。
++ */
++function resolveBase() {
++  const explicit =
++    (process.argv.includes("--base")
++      ? process.argv[process.argv.indexOf("--base") + 1]
++      : null) || process.env.SELFHOST_BASE || null;
++  return resolveBaseShared(ROOT, { explicit });
++}
++
++const dryRun = process.argv.includes("--dry-run");
++const force = process.argv.includes("--force");
++
++function git(args) {
++  return execFileSync("git", args, { cwd: ROOT, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 });
++}
++
++/**
++ * 取一组路径（NUL 分隔）。
++ *
++ * 必须用 -z：git 默认 core.quotePath=true，会把非 ASCII 路径转义成
++ * "\346\224\271..." 这类带引号的字符串；若直接把它回传给 git add / git rm
++ * 会因 pathspec 不匹配而失败（本仓库含「改造说明.md」「docs/中文文档.md」）。
++ * -z 输出以 NUL 分隔且不做任何转义，可安全还原为字面路径。
++ */
++function gitPaths(args) {
++  // -z 紧跟子命令：若写在末尾且命令行中出现 `--` pathspec，git 会把 -z 当成路径参数
++  const out = execFileSync("git", [args[0], "-z", ...args.slice(1)], {
++    cwd: ROOT,
++    encoding: "utf8",
++    maxBuffer: 64 * 1024 * 1024,
++  });
++  return out.split("\0").filter(Boolean);
++}
++
++function toPosix(p) {
++  return p.split(path.sep).join("/");
++}
++
++/**
++ * 内容不变则不落盘（幂等写入）。
++ *
++ * 为什么必须这样：即使内容逐字节相同，`writeFile` 也会刷新 mtime，使 git 的
++ * 索引 stat 缓存失效 —— `git status` 于是报出「内容相同」的伪修改
++ * （porcelain v2 里两侧 blob 哈希完全一致，却仍标记 .M）。而
++ * scripts/sync-upstream.mjs 的 ensureClean() 以 `git status --porcelain`
++ * 为准，会把这种伪修改误判成「工作区不干净」并直接拦截同步。
++ * 幂等写入让「导出」成为可反复执行、无副作用的操作。
++ */
++async function writeIfChanged(target, content) {
++  try {
++    if (existsSync(target) && readFileSync(target, "utf8") === content) return false;
++  } catch {
++    /* 读取失败则照常写入 */
++  }
++  await writeFile(target, content, "utf8");
++  return true;
++}
++
++async function main() {
++  // 0) 前置检查：确认处于 git 仓库且能与上游比较
++  try {
++    git(["rev-parse", "--git-dir"]);
++  } catch {
++    throw new Error("当前目录不是 git 仓库");
++  }
++
++  // 1) 差异基线：相对「上游」而非 HEAD —— 见 resolveBase() 注释，这是本脚本最容易出错的地方
++  const { base, ref: baseRef, fallback, degraded } = resolveBase();
++  if (fallback) console.warn(fallbackWarning(ROOT));
++  if (degraded) console.warn(degradedWarning(baseRef));
++
++  // 2) 让未跟踪文件进入 diff（-N = intent-to-add，只登记不暂存内容）
++  const untracked = gitPaths(["ls-files", "--others", "--exclude-standard"]).filter(
++    (p) => !OVERLAY_PATHS.some((o) => p === o || p.startsWith(`${o}/`))
++  );
++
++  if (untracked.length) {
++    for (const f of untracked) git(["add", "-N", "--", f]);
++  }
++
++  // 3) 删除清单：相对基线被删除的已跟踪文件
++  const deleted = gitPaths(["diff", "--name-only", "--diff-filter=D", base])
++    .filter((p) => !OVERLAY_PATHS.some((o) => p === o || p.startsWith(`${o}/`)))
++    .sort();
++
++  // 4) 补丁：修改与新增（显式排除删除，删除交给 delete.txt）
++  const excludeArgs = [
++    ...OVERLAY_PATHS.flatMap((p) => [`: (exclude)${p}`, `:(exclude)${p}/**`]),
++    ...DERIVED_PATHS.map((p) => `:(exclude)${p}`),
++  ];
++  const patch = git([
++    "diff",
++    base,
++    "--diff-filter=d", // 小写 d = 排除 Deleted
++    "--binary",
++    "--no-color",
++    "--",
++    ".",
++    ...excludeArgs,
++  ]);
++
++  const bytes = Buffer.byteLength(patch, "utf8");
++  const crlf = (patch.match(/\r\n/g) || []).length;
++  const patchFiles = (patch.match(/^diff --git /gm) || []).length;
++  console.log(`仓库根目录: ${ROOT}`);
++  console.log(`差异基线: ${baseRef} → ${base.slice(0, 10)}`);
++  console.log(`待删除文件: ${deleted.length} 个`);
++  console.log(`派生产物(不进补丁): ${DERIVED_PATHS.join(", ") || "无"}`);
++  console.log(`补丁字节数: ${bytes}（覆盖 ${patchFiles} 个文件）`);
++  if (crlf > 0) {
++    // git diff 正常产出 LF；出现 CR 说明过滤/配置异常，补丁在 git apply 时会大面积失败
++    console.warn(
++      `⚠ 补丁含 ${crlf} 处 CRLF —— git apply 对行尾敏感，会导致「patch does not apply」。\n` +
++        `  请确认 .gitattributes 含 \`*.patch -text\`（禁止对补丁做行尾转换）。`
++    );
++  }
++  console.log("-".repeat(60));
++  if (deleted.length) {
++    for (const f of deleted) console.log(`  D ${f}`);
++  }
++
++  // 5) 空补丁保护：绝不允许用一个空叠加层覆盖已有叠加层。
++  //    触发条件：改造已提交但基线取错（最典型的是「相对于 HEAD」）、或远端未抓取。
++  //    静默覆盖的后果是下次同步把上游代码原样贴回，改造全部丢失 —— 必须硬拦。
++  if (patchFiles === 0 && !force) {
++    console.error(
++      "\n✗ 拒绝导出：算出的补丁覆盖 0 个文件，写入会清空叠加层。\n" +
++        `  实际使用基线：${baseRef} → ${base.slice(0, 10)}\n` +
++        "  排查：① 上游远端是否已抓取（git fetch upstream）；② 是否需要用 --base 显式指定上游提交。\n" +
++        "  确认无误仍要写入请加 --force。"
++    );
++    process.exit(1);
++  }
++
++  if (dryRun) {
++    console.log("\n--dry-run：未写入任何文件。");
++    return;
++  }
++
++  await mkdir(PATCH_DIR, { recursive: true });
++
++  // 清掉「非本次目标」的过期补丁切片，避免被同步任务一起应用。
++  // 必须保留目标文件名本身：否则下面的幂等写入会因文件刚被删掉而必然重写，
++  // 幂等性（以及由此带来的「无伪修改」）就失效了。
++  const PATCH_NAME = "0001-selfhost-overlay.patch";
++  const patchPath = path.join(PATCH_DIR, PATCH_NAME);
++  if (existsSync(PATCH_DIR)) {
++    for (const f of await readdir(PATCH_DIR)) {
++      if (f.endsWith(".patch") && f !== PATCH_NAME) await rm(path.join(PATCH_DIR, f));
++    }
++  }
++
++  const wrotePatch = await writeIfChanged(patchPath, patch);
++  const deleteContent = deleted.length
++    ? `# 每次同步时无条件删除的路径（相对仓库根），按行分隔，# 开头为注释\n${deleted.join("\n")}\n`
++    : "# 无待删除文件\n";
++  const wroteDelete = await writeIfChanged(DELETE_FILE, deleteContent);
++
++  console.log("-".repeat(60));
++  console.log(`${wrotePatch ? "已写入" : "未变化"} ${toPosix(path.relative(ROOT, patchPath))}`);
++  console.log(`${wroteDelete ? "已写入" : "未变化"} ${toPosix(path.relative(ROOT, DELETE_FILE))}`);
++  console.log("\n记得把 selfhost/ 一起提交，同步任务才能拿到最新叠加层。");
++}
++
++main().catch((err) => {
++  console.error(`错误: ${err.message}`);
++  process.exit(1);
++});
+diff --git a/scripts/lib/selfhost-base.mjs b/scripts/lib/selfhost-base.mjs
+new file mode 100644
+index 0000000..e10f0e6
+--- /dev/null
++++ b/scripts/lib/selfhost-base.mjs
+@@ -0,0 +1,67 @@
++/**
++ * 自建叠加层的「差异基线」解析（被 export-overlay / verify-overlay 共用）
++ *
++ * 为什么需要它：叠加层保存的是「相对**上游**的差异」。基线必须是上游那个提交，
++ * 而不是 HEAD。用 HEAD 当基线只在本仓库「HEAD 恰好等于上游、改动全部未提交」时成立；
++ * 一旦改造被提交（同步前置条件就要求工作区干净，所以提交是必然的），
++ * 以 HEAD 为基线算出的差异会变成空 —— 叠加层被静默清空，下次同步即丢失全部改造。
++ *
++ * 因此统一取 `merge-base HEAD <上游分支>`：
++ *   · 未提交时：HEAD == 上游 → 共同祖先即 HEAD（与旧行为一致）
++ *   · 已提交时：共同祖先 = 上游提交 → 差异正好是全部改造
++ *
++ * 远端分支候选顺序（未显式指定时）：upstream/main > origin/main > 降级为 HEAD（并告警）。
++ *
++ * ⚠️ fork 模式（origin = 你自己的仓库，upstream = 原作者仓库）下，origin/main 是**你
++ *    自己的改造线**，不能当上游基线。因此首选必须是 upstream/main；一旦退到 origin/main，
++ *    返回 degraded=true，调用方必须告警 —— 否则「origin/main + 少量未提交改动」会算出一个
++ *    很短的非空补丁，绕过「空补丁保护」把叠加层覆盖掉。
++ */
++
++import { execFileSync } from "node:child_process";
++
++export const UPSTREAM_REF_CANDIDATES = ["upstream/main", "origin/main"];
++
++export function resolveBase(ROOT, { explicit = null } = {}) {
++  const candidates = explicit ? [explicit, ...UPSTREAM_REF_CANDIDATES] : UPSTREAM_REF_CANDIDATES;
++  for (const ref of candidates) {
++    if (!ref) continue;
++    try {
++      const base = execFileSync("git", ["merge-base", "HEAD", ref], {
++        cwd: ROOT,
++        encoding: "utf8",
++        // 静默 stderr：探测未抓取的远端会打印 "fatal: Not a valid object name"，
++        // 属于正常探测失败，不该吓到使用者
++        stdio: ["ignore", "pipe", "ignore"],
++      }).trim();
++      if (base) {
++        // 非显式指定、且未采用首选候选（upstream/main）→ 标记为「降级引用」。
++        const degraded = !explicit && ref !== UPSTREAM_REF_CANDIDATES[0];
++        return { base, ref, fallback: false, degraded };
++      }
++    } catch {
++      /* 该远端不存在或未抓取，试下一个 */
++    }
++  }
++  return { base: "HEAD", ref: "(降级:HEAD)", fallback: true, degraded: false };
++}
++
++/** 全部候选都不可用（退化为相对 HEAD）时的统一提示文案 */
++export function fallbackWarning(ROOT) {
++  return (
++    "⚠ 未能确定上游基线（upstream/main 与 origin/main 均不可用）→ 退化为「相对 HEAD」。\n" +
++    "  若改造已提交，这会导致叠加层被算成空。请先配置并抓取上游远端：\n" +
++    "    git remote add upstream https://github.com/<作者>/<仓库>.git && git fetch upstream\n" +
++    "  或显式指定基线：--base <上游提交>"
++  );
++}
++
++/** 退用了非首选基线（通常是 origin/main）时的提示：fork 模式下这很危险 */
++export function degradedWarning(ref) {
++  return (
++    `⚠ 未找到 upstream/main，改用 ${ref} 作为差异基线。\n` +
++    "  fork 模式下 origin 指向「你自己的仓库」，其 main 可能已包含改造 —— 以它为基线会把改造算成空。\n" +
++    "  请配置原作者仓库为 upstream 并抓取后重试：\n" +
++    "    git remote add upstream https://github.com/<作者>/<仓库>.git && git fetch upstream"
++  );
++}
+diff --git a/scripts/rebrand.mjs b/scripts/rebrand.mjs
+new file mode 100644
+index 0000000..07443c9
+--- /dev/null
++++ b/scripts/rebrand.mjs
+@@ -0,0 +1,258 @@
++#!/usr/bin/env node
++/**
++ * 品牌 / 域名批量替换工具
++ *
++ * 用途：本项目由上游开源仓库 fork 而来，源码与文档中散布着原作者品牌名、
++ * 域名与邮箱。本脚本把它们替换成自建者自己的信息。
++ *
++ * 用法（默认 dry-run，只报告不写盘）：
++ *   node scripts/rebrand.mjs --name "口袋时光" --domain 113826.xyz \
++ *        --url https://parse.113826.xyz
++ *   node scripts/rebrand.mjs ... --write      # 确认无误后加 --write 真正写入
++ *
++ * 可选：
++ *   --repo <owner/name>   你的 GitHub 仓库，用于替换 README 里的部署按钮与镜像地址
++ *   --email <addr>        联系邮箱。**不传则视为「去掉作者邮箱」**：脚本不会写入任何
++ *                         邮箱，并把 siteConfig 中的邮箱默认值改为空。
++ *   --dir <path>          目标根目录（默认脚本所在仓库根目录）
++ *
++ * 保留原样（KEEP_ORIGINAL）：SEO 文案、品牌 SVG、README 等按需求保持上游原文，
++ * 不做替换。见下方常量，可按需注释掉某一项以恢复替换。
++ *
++ * 行级豁免：任何一行只要包含 `rebrand-keep`，该行就不参与替换。用于代码注释中
++ * 需要引用「上游原样信息」的场合（例如「原本只允许 *.shenzjd.com」），避免语义
++ * 被反转，同时保证脚本可重复运行（幂等）。
++ *
++ * 替换顺序经过设计：先替换完整 URL，再替换裸域名，避免出现协议残留。
++ */
++
++import { readFile, writeFile, readdir } from "node:fs/promises";
++import { existsSync } from "node:fs";
++import path from "node:path";
++import { fileURLToPath } from "node:url";
++
++/** 保持上游原文、不参与替换的路径（相对仓库根；目录写法末尾带 /，按前缀匹配） */
++const KEEP_ORIGINAL = [
++  "README.md",
++  "src/config/seo-platforms.ts",
++  "src/app/page.tsx",
++  "src/app/platform/",
++  "public/brand/",
++  "改造说明.md",
++  "selfhost/",
++  "scripts/rebrand.mjs",
++];
++
++const SKIP_DIRS = new Set([
++  ".git", "node_modules", ".next", ".open-next", ".wrangler", ".turbo",
++  "dist", "build", "coverage",
++]);
++
++const SKIP_FILES = new Set(["package-lock.json", "pnpm-lock.yaml", "yarn.lock"]);
++
++const TEXT_EXT = new Set([
++  ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json", ".md", ".mdx",
++  ".css", ".html", ".svg", ".txt", ".xml", ".yml", ".yaml", ".toml",
++  ".webmanifest", ".example", ".sh", "",
++]);
++
++const SELF_FILE = fileURLToPath(import.meta.url);
++
++/** 行级豁免标记：任何一行包含该字符串即跳过替换（用于需引用上游原样信息的注释） */
++const KEEP_MARKER = "rebrand-keep";
++
++function parseArgs(argv) {
++  const args = {};
++  for (let i = 0; i < argv.length; i++) {
++    const a = argv[i];
++    if (a === "--write") { args.write = true; continue; }
++    if (a.startsWith("--")) {
++      const val = argv[i + 1];
++      if (val === undefined || val.startsWith("--")) {
++        throw new Error(`参数 ${a} 缺少值`);
++      }
++      args[a.slice(2)] = val;
++      i++;
++    }
++  }
++  return args;
++}
++
++function requireArg(args, key, label) {
++  if (!args[key]) throw new Error(`缺少必填参数 --${key}（${label}）`);
++  return String(args[key]);
++}
++
++async function walk(dir, out = []) {
++  const entries = await readdir(dir, { withFileTypes: true });
++  for (const e of entries) {
++    const full = path.join(dir, e.name);
++    if (e.isDirectory()) {
++      if (SKIP_DIRS.has(e.name)) continue;
++      await walk(full, out);
++    } else if (e.isFile()) {
++      if (SKIP_FILES.has(e.name)) continue;
++      if (path.resolve(full) === path.resolve(SELF_FILE)) continue;
++      if (!TEXT_EXT.has(path.extname(e.name))) continue;
++      out.push(full);
++    }
++  }
++  return out;
++}
++
++function isKept(relPath) {
++  const p = relPath.split(path.sep).join("/");
++  return KEEP_ORIGINAL.some((k) => p === k || p.startsWith(k));
++}
++
++function buildRules(args) {
++  const name = requireArg(args, "name", "你的品牌名");
++  const domain = requireArg(args, "domain", "你的域名，如 113826.xyz");
++  const url = requireArg(args, "url", "你的站点完整地址").replace(/\/+$/, "");
++
++  let host = url;
++  try { host = new URL(url).host; } catch { /* 允许非标准 url */ }
++
++  const rules = [
++    // 1) 完整 URL（含协议）必须最先替换，否则会被裸域名规则切碎
++    { label: "站点 URL", from: /https:\/\/parse\.shenzjd\.com/g, to: url },
++    { label: "站点 host", from: /parse\.shenzjd\.com/g, to: host },
++    // 2) 裸域名（含子域与注释中的后缀说明）
++    { label: "域名", from: /shenzjd\.com/g, to: domain },
++    // 3) 品牌名
++    { label: "品牌名", from: /神族九帝/g, to: name },
++    // 4) Cloudflare Worker 名（只允许小写字母数字与连字符）
++    {
++      label: "Worker 名称",
++      from: /parse-shenzjd-com/g,
++      to: `parse-${domain.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}`,
++    },
++  ];
++
++  // 作者邮箱：默认「去掉」——置空而不是替换
++  if (args.email) {
++    rules.push({ label: "作者邮箱", from: /shenzujiudi@gmail\.com/g, to: String(args.email) });
++  } else {
++    rules.push({ label: "作者邮箱(去除)", from: /shenzujiudi@gmail\.com/g, to: "" });
++  }
++
++  if (args.repo) {
++    const repo = String(args.repo).replace(/^\/+|\/+$/g, "");
++    const repoName = repo.split("/").pop();
++    rules.push(
++      { label: "镜像地址", from: /(ghcr\.io|docker\.io)\/wu529778790\/parse\.shenzjd\.com/g, to: `$1/${repo}` },
++      { label: "仓库引用", from: /wu529778790\/parse\.shenzjd\.com/g, to: repo },
++      { label: "仓库短名", from: /repository-name=parse\.shenzjd\.com/g, to: `repository-name=${repoName}` }
++    );
++  }
++
++  return { rules, name, domain, url };
++}
++
++function applyRules(text, rules, stats) {
++  // 行级豁免：含 rebrand-keep 标记的行不参与替换。
++  // 用途：代码注释里常需引用「上游原样」的品牌/域名（例如「原本只允许 *.shenzjd.com」），
++  // 若被一并替换会造成语义反转；且重复运行会反复改写。加上标记即可长期豁免。
++  if (text.includes(KEEP_MARKER)) {
++    const out = [];
++    for (const line of text.split("\n")) {
++      if (line.includes(KEEP_MARKER)) {
++        out.push(line);
++        continue;
++      }
++      let l = line;
++      for (const r of rules) {
++        const m = l.match(r.from);
++        if (!m) continue;
++        stats.set(r.label, (stats.get(r.label) || 0) + m.length);
++        l = l.replace(r.from, r.to);
++      }
++      out.push(l);
++    }
++    return out.join("\n");
++  }
++
++  let out = text;
++  for (const r of rules) {
++    const matches = out.match(r.from);
++    if (!matches) continue;
++    stats.set(r.label, (stats.get(r.label) || 0) + matches.length);
++    out = out.replace(r.from, r.to);
++  }
++  return out;
++}
++
++async function main() {
++  const args = parseArgs(process.argv.slice(2));
++  if (args.help) {
++    console.log(await readFile(fileURLToPath(import.meta.url), "utf8"));
++    return;
++  }
++
++  const root = path.resolve(
++    args.dir || path.join(path.dirname(fileURLToPath(import.meta.url)), "..")
++  );
++  if (!existsSync(root)) throw new Error(`目录不存在: ${root}`);
++
++  const { rules, name, domain, url } = buildRules(args);
++
++  console.log(`目标目录: ${root}`);
++  console.log(`品牌名  : ${name}`);
++  console.log(`域名    : ${domain}`);
++  console.log(`站点地址: ${url}`);
++  console.log(`邮箱    : ${args.email ? args.email : "（去掉作者邮箱，不写入任何地址）"}`);
++  console.log(`模式    : ${args.write ? "写入（--write）" : "预演（dry-run，不修改文件）"}`);
++  console.log(`保留原样: ${KEEP_ORIGINAL.join(", ")}`);
++  console.log("-".repeat(60));
++
++  const files = await walk(root);
++  const stats = new Map();
++  const changed = [];
++  const skipped = [];
++
++  for (const file of files) {
++    const rel = path.relative(root, file);
++    let text;
++    try { text = await readFile(file, "utf8"); } catch { continue; }
++
++    if (isKept(rel)) {
++      if (rules.some((r) => text.match(r.from))) skipped.push(rel);
++      continue;
++    }
++
++    const next = applyRules(text, rules, stats);
++    if (next !== text) {
++      changed.push(rel);
++      if (args.write) await writeFile(file, next, "utf8");
++    }
++  }
++
++  console.log(`扫描文本文件: ${files.length}`);
++  console.log(`命中替换的文件: ${changed.length}`);
++  console.log("-".repeat(60));
++  for (const [label, count] of [...stats.entries()].sort((a, b) => b[1] - a[1])) {
++    console.log(`  ${label.padEnd(14)} ${count} 处`);
++  }
++  console.log("-".repeat(60));
++  for (const f of changed.slice(0, 60)) console.log(`  ${f}`);
++  if (changed.length > 60) console.log(`  ... 其余 ${changed.length - 60} 个文件`);
++
++  if (skipped.length) {
++    console.log("-".repeat(60));
++    console.log(`按 KEEP_ORIGINAL 保留原文（含原作者品牌字样的）文件 ${skipped.length} 个：`);
++    for (const f of skipped.slice(0, 40)) console.log(`  ${f}`);
++    if (skipped.length > 40) console.log(`  ... 其余 ${skipped.length - 40} 个文件`);
++    console.log("注意：这些文件对外仍会显示原作者品牌，如需要替换请从 KEEP_ORIGINAL 中移除对应项。");
++  }
++
++  if (!args.write) {
++    console.log("\n以上为预演结果。确认无误后加上 --write 重新执行以写入。");
++  } else {
++    console.log("\n替换完成。请重新构建（npm run build）使 NEXT_PUBLIC_* 与文案生效。");
++  }
++}
++
++main().catch((err) => {
++  console.error(`错误: ${err.message}`);
++  process.exit(1);
++});
+diff --git a/scripts/selfhost-guard.mjs b/scripts/selfhost-guard.mjs
+new file mode 100644
+index 0000000..74abe78
+--- /dev/null
++++ b/scripts/selfhost-guard.mjs
+@@ -0,0 +1,300 @@
++#!/usr/bin/env node
++/**
++ * 自建改造不变量守卫（self-host invariant guard）
++ *
++ * 用途：上游同步任务在推送前运行本脚本。若上游的改动把「已剥离的第三方认证 /
++ * 作者前端资源」重新带回来，或把自建改造的关键点删掉，本脚本立即失败，阻止推送。
++ *
++ * 为什么需要它：补丁栈只保证「我们改过的地方」被重放。上游若在别处新增了对第三方
++ * 认证的引用（新文件、新的 import），补丁不会冲突，构建也可能通过，问题会静默上线。
++ * 本脚本把这些不变量显式断言出来，让同步任务以「失败」而不是「静默退化」结束。
++ *
++ * 用法：node scripts/selfhost-guard.mjs
++ * 退出码：0 全部通过；1 存在违规（输出逐条说明）
++ *
++ * 说明：检查前会剥离注释，避免命中「说明文字里提到 wx-auth」这类误报。
++ */
++
++import { readFile, readdir, stat } from "node:fs/promises";
++import { existsSync } from "node:fs";
++import path from "node:path";
++import { fileURLToPath } from "node:url";
++
++const ROOT = path.resolve(path.join(path.dirname(fileURLToPath(import.meta.url)), ".."));
++
++/** 代码级标记的扫描范围（含测试：测试里若出现旧守卫的引用，同样是回归信号） */
++const CODE_SCAN_DIRS = ["src", "tests"];
++/** 第三方资源域名的扫描范围（不含 tests：测试夹具会刻意使用无关外链 URL） */
++const ASSET_SCAN_DIRS = ["src", "public"];
++
++const SKIP_DIRS = new Set(["node_modules", ".git", ".next", ".open-next", ".wrangler", "coverage"]);
++const SOURCE_EXT = new Set([".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".css", ".json", ".html", ".svg", ".webmanifest"]);
++
++/** 必须不存在的文件（相对仓库根） */
++const FORBIDDEN_FILES = [
++  "src/lib/wx-auth-client.ts",
++  "src/lib/wx-auth-guard.ts",
++  "src/lib/floating-unlock-client.ts",
++  "src/config/floating-unlock.ts",
++  "src/types/custom-elements.d.ts",
++  "public/robots.txt",
++  "public/sitemap.xml",
++  ".github/workflows/sync-upstream.yml",
++  // 自建版部署目标已收敛为 Docker / 服务器，Cloudflare 专用件不应出现
++  "wrangler.toml",
++  "open-next.config.ts",
++];
++
++/** 必须不存在于代码（已剥离注释）：这些标识只可能来自被剥离的认证/广告模块 */
++const FORBIDDEN_CODE = [
++  "AUTH_REQUIRED_ROUTES",
++  "checkWxAuthToken",
++  "getWxAuthToken",
++  "getWxAuthUser",
++  "showWxAuth",
++  "unlockByAd",
++  "window.WxAuth",
++  "wx-auth-guard",
++  "wx-auth-client",
++  "opennextjs", // Cloudflare 适配器：自建版部署目标为 Docker / 服务器
++];
++
++/** 必须不存在于前端资源与运行时代码：第三方作者域名与外链脚本 */
++const FORBIDDEN_ASSETS = [
++  "@wu529778790",
++  "cdn.jsdmirror.com",
++  "img.shenzjd.com",
++  "wx-auth.shenzjd.com",
++  "unpkg.com",
++];
++
++/** 必须不存在于指定文件的字符串（防止上游把已剥离的平台专用件重新写回配置）
++ *  注意：只断言「有实质影响」的项。像 .gitignore 里的构建产物忽略规则这类纯装饰性
++ *  内容不在此列 —— 上游恢复它无害，不该因此让整次同步失败（避免误报阻断）。 */
++const FORBIDDEN_IN_FILE = [
++  { file: "package.json", needle: "@opennextjs/cloudflare", why: "Cloudflare 部署专用依赖，自建版已移除" },
++  { file: "package.json", needle: "build:cf", why: "Cloudflare 专用构建脚本，自建版已移除" },
++];
++
++/** 必须存在于指定文件中的字符串（自建改造关键点） */
++const REQUIRED = [
++  { file: "src/lib/api-utils.js", needle: "ALLOWED_ORIGINS", why: "CORS 放行名单须由环境变量控制" },
++  { file: "src/app/api/stats/route.js", needle: "STATS_API_KEY", why: "/api/stats 须用自有密钥鉴权" },
++  { file: "src/config/site.ts", needle: "NEXT_PUBLIC_SITE_URL", why: "站点身份须可由环境变量覆盖" },
++  { file: "src/lib/result-cache.js", needle: "NEXT_PUBLIC_SITE_URL", why: "缓存 key 须按本站地址派生" },
++  { file: "src/config/site.ts", needle: "NEXT_PUBLIC_CONTACT_EMAIL", why: "邮箱须可配置（默认留空）" },
++  { file: ".github/workflows/selfhost-sync.yml", needle: "selfhost", why: "自建同步工作流须存在" },
++];
++
++/** 必须存在的文件 */
++const REQUIRED_FILES = [
++  "selfhost/delete.txt",
++  "改造说明.md",
++];
++
++/**
++ * 运行时引擎下限（package.json → engines）。
++ *
++ * 为什么必须断言：`undici@8` 的 engines 声明为 `node >= 22.19.0`，它内部的
++ * webidl 层会把 `node:worker_threads` 的 `markAsUncloneable` 挂到 Headers/Request
++ * 等构造器上（`webidl.util.markAsUncloneable(this)`）。该 API 在 Node 20 上不存在，
++ * 于是被赋值为 `undefined`，构造第一个 Headers 时即抛
++ * `TypeError: ... markAsUncloneable is not a function` → B 站解析 HTTP 500。
++ *
++ * 这类问题的危险之处：**构建、类型检查、`npm test` 全都不会失败**，只有真实请求
++ * 打到 undici 链路（本仓库中即 B 站）才暴露。因此必须由守卫在同步阶段提前拦下，
++ * 而不是等它在生产环境以一个 500 的形式出现。
++ */
++const ENGINE_FLOOR = {
++  file: "package.json",
++  field: "node",
++  min: "22.19.0",
++  why: "undici@8 要求 node >= 22.19.0；低于此版本构造 Headers 时 markAsUncloneable 为 undefined，B 站解析运行时 500",
++};
++
++/** 提取形如 ">=22.19.0" / "^22" / "22.19.0" 中的数字版本 */
++function parseVersion(spec) {
++  const m = String(spec).match(/(\d+)\.(\d+)\.(\d+)/);
++  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : null;
++}
++
++/** actual 是否 >= min（比较主/次/补丁三段） */
++function versionAtLeast(actual, min) {
++  const a = parseVersion(actual);
++  const b = parseVersion(min);
++  if (!a || !b) return false;
++  for (let i = 0; i < 3; i++) {
++    if (a[i] !== b[i]) return a[i] > b[i];
++  }
++  return true;
++}
++
++async function walk(dir, out = []) {
++  let entries;
++  try {
++    entries = await readdir(dir, { withFileTypes: true });
++  } catch {
++    return out;
++  }
++  for (const e of entries) {
++    const full = path.join(dir, e.name);
++    if (e.isDirectory()) {
++      if (SKIP_DIRS.has(e.name)) continue;
++      await walk(full, out);
++    } else if (e.isFile()) {
++      out.push(full);
++    }
++  }
++  return out;
++}
++
++/** 剥离注释：行注释、块注释、HTML 注释。避免「说明文字里提到」造成误报 */
++function stripComments(src) {
++  return src
++    .replace(/\/\*[\s\S]*?\*\//g, " ")
++    .replace(/<!--[\s\S]*?-->/g, " ")
++    .replace(/(^|[^:\\])\/\/[^\n]*/g, "$1");
++}
++
++async function main() {
++  const failures = [];
++  const notes = [];
++
++  // 1) 禁止文件
++  for (const rel of FORBIDDEN_FILES) {
++    if (existsSync(path.join(ROOT, rel))) {
++      failures.push(`禁止文件仍然存在：${rel}（上游可能把已剥离的模块带回来了）`);
++    }
++  }
++
++  // 2) 必须文件
++  for (const rel of REQUIRED_FILES) {
++    if (!existsSync(path.join(ROOT, rel))) {
++      failures.push(`缺少必要文件：${rel}（叠加层可能未完整应用）`);
++    }
++  }
++
++  // 3) 必须存在的字符串
++  for (const { file, needle, why } of REQUIRED) {
++    const full = path.join(ROOT, file);
++    if (!existsSync(full)) {
++      failures.push(`缺少必要文件：${file}（${why}）`);
++      continue;
++    }
++    const text = await readFile(full, "utf8");
++    if (!text.includes(needle)) {
++      failures.push(`${file} 中未找到 ${needle}：${why}`);
++    }
++  }
++
++  // 3.5) 指定文件中必须不出现的字符串
++  for (const { file, needle, why } of FORBIDDEN_IN_FILE) {
++    const full = path.join(ROOT, file);
++    if (!existsSync(full)) continue;
++    const text = await readFile(full, "utf8");
++    if (text.includes(needle)) {
++      failures.push(`${file} 中重新出现「${needle}」：${why}`);
++    }
++  }
++
++  // 3.6) 运行时引擎下限（见 ENGINE_FLOOR 注释：低于下限时 B 站解析运行时 500）
++  {
++    const full = path.join(ROOT, ENGINE_FLOOR.file);
++    if (!existsSync(full)) {
++      failures.push(`缺少必要文件：${ENGINE_FLOOR.file}`);
++    } else {
++      let engines = {};
++      try {
++        engines = JSON.parse(await readFile(full, "utf8")).engines || {};
++      } catch (e) {
++        failures.push(`${ENGINE_FLOOR.file} 无法解析为 JSON：${e.message}`);
++      }
++      const declared = engines[ENGINE_FLOOR.field];
++      if (!declared) {
++        failures.push(
++          `${ENGINE_FLOOR.file} 未声明 engines.${ENGINE_FLOOR.field}：${ENGINE_FLOOR.why}`
++        );
++      } else if (!versionAtLeast(declared, ENGINE_FLOOR.min)) {
++        failures.push(
++          `${ENGINE_FLOOR.file} 的 engines.${ENGINE_FLOOR.field} = "${declared}" 低于下限 ${ENGINE_FLOOR.min}：${ENGINE_FLOOR.why}`
++        );
++      }
++    }
++  }
++
++  // 4) 禁止标记（剥离注释后匹配），代码级与资源级分开扫描
++  async function scan(dirs) {
++    const files = (await Promise.all(dirs.map((d) => walk(path.join(ROOT, d))))).flat();
++    const out = [];
++    for (const full of files) {
++      if (!SOURCE_EXT.has(path.extname(full))) continue;
++      let text;
++      try {
++        text = await readFile(full, "utf8");
++      } catch {
++        continue;
++      }
++      out.push({
++        rel: path.relative(ROOT, full).split(path.sep).join("/"),
++        code: stripComments(text),
++      });
++    }
++    return out;
++  }
++
++  const codeFiles = await scan(CODE_SCAN_DIRS);
++  const assetFiles = await scan(ASSET_SCAN_DIRS);
++
++  for (const { rel, code } of codeFiles) {
++    for (const needle of FORBIDDEN_CODE) {
++      if (code.includes(needle)) {
++        failures.push(`${rel} 中出现被剥离的认证/广告模块标记「${needle}」`);
++      }
++    }
++  }
++  for (const { rel, code } of assetFiles) {
++    for (const needle of FORBIDDEN_ASSETS) {
++      if (code.includes(needle)) {
++        failures.push(`${rel} 中出现第三方作者资源「${needle}」`);
++      }
++    }
++  }
++
++  // 5) 补丁栈非空
++  const patchDir = path.join(ROOT, "selfhost", "patches");
++  let patchCount = 0;
++  if (existsSync(patchDir)) {
++    patchCount = (await readdir(patchDir)).filter((f) => f.endsWith(".patch")).length;
++  }
++  if (patchCount === 0) {
++    failures.push("selfhost/patches 下没有任何补丁，同步任务将无法重建自建改造");
++  } else {
++    notes.push(`补丁栈：${patchCount} 个补丁`);
++  }
++
++  notes.push(`扫描文件：代码 ${codeFiles.length} 个 / 资源 ${assetFiles.length} 个`);
++  notes.push(`检查项：禁止文件 ${FORBIDDEN_FILES.length} · 代码标记 ${FORBIDDEN_CODE.length} · 资源域名 ${FORBIDDEN_ASSETS.length} · 禁止写入 ${FORBIDDEN_IN_FILE.length} · 必需项 ${REQUIRED.length} · 引擎下限 >=${ENGINE_FLOOR.min}`);
++
++  console.log("自建改造不变量检查");
++  console.log("-".repeat(60));
++  for (const n of notes) console.log(`  · ${n}`);
++  console.log("-".repeat(60));
++
++  if (failures.length) {
++    console.error(`✗ 未通过：发现 ${failures.length} 项违规\n`);
++    for (const f of failures) console.error(`  ✗ ${f}`);
++    console.error(
++      "\n处理建议：上游很可能已改动相关代码。请合并上游最新代码到本地，" +
++        "确认自建改造仍然成立，然后重新运行 `npm run selfhost:export` 导出补丁并提交。\n" +
++        "本次同步不会推送，线上仍运行上一个正常版本。"
++    );
++    process.exit(1);
++  }
++
++  console.log("✓ 通过：自建改造关键不变量全部成立");
++}
++
++main().catch((err) => {
++  console.error(`守卫脚本自身出错: ${err.stack || err.message}`);
++  process.exit(1);
++});
+diff --git a/scripts/sync-upstream.mjs b/scripts/sync-upstream.mjs
+new file mode 100644
+index 0000000..92ded8b
+--- /dev/null
++++ b/scripts/sync-upstream.mjs
+@@ -0,0 +1,405 @@
++#!/usr/bin/env node
++/**
++ * 本地跟进上游更新（手动路径；云端自动路径见 .github/workflows/selfhost-sync.yml）
++ *
++ * 背景：本仓库是上游开源项目的 fork。推荐把远端配置为：
++ *     origin   = 你自己的 fork（可写，用于发布）
++ *     upstream = 作者本人的仓库（只读，上游更新来源）
++ * 配好远端后，云端 selfhost-sync.yml 会每天自动跟进；本脚本用**同样的机制**在本地
++ * 完成同一件事，便于先本地验证、再一键发布（--push）。
++ *
++ * 远端配置（一次性）：
++ *     git remote set-url origin https://github.com/<你的账号>/parse.shenzjd.com.git
++ *     git remote add upstream https://github.com/wu529778790/parse.shenzjd.com.git
++ *     git fetch upstream
++ *
++ * 机制：
++ *
++ *   ① 记下当前 HEAD 作为回滚锚点（打 tag selfhost-pre-sync）
++ *   ② 备份 selfhost/ 叠加层（重置会把它删掉）
++ *   ③ fetch 上游最新 → 把工作区重置为上游
++ *   ④ 重新贴回叠加层（补丁栈 + 删除清单）
++ *   ⑤ 固定 .github/workflows 为同步前的版本（与云端工作流行为一致）
++ *   ⑥ 不变量守卫 → 等价性验证 →（可选）安装/测试/构建
++ *   ⑦ 全绿才提交到本地分支；默认**不推送**，加 --push 才推送到 origin（你自己的 fork）
++ *
++ * 用法：
++ *   node scripts/sync-upstream.mjs                 # 完整流程
++ *   node scripts/sync-upstream.mjs --check-only    # 只 fetch 并报告上游是否有更新
++ *   node scripts/sync-upstream.mjs --skip-verify   # 跳过 npm ci / test / build（快，但风险高）
++ *   node scripts/sync-upstream.mjs --remote upstream --branch main
++ *   node scripts/sync-upstream.mjs --push           # 通过校验后强制推送到 origin（你的 fork）
++ *
++ * 前置要求：工作区必须**干净**（改动已提交）。原因见下方 ensureClean()。
++ * 失败时：打印回滚命令，不会留下半成品状态（提交只在全部步骤通过后发生）。
++ */
++
++import { execFileSync } from "node:child_process";
++import {
++  cpSync,
++  existsSync,
++  mkdtempSync,
++  readdirSync,
++  readFileSync,
++  rmSync,
++  writeFileSync,
++} from "node:fs";
++import os from "node:os";
++import path from "node:path";
++import { fileURLToPath } from "node:url";
++
++const ROOT = path.resolve(path.join(path.dirname(fileURLToPath(import.meta.url)), ".."));
++
++const OWN_WORKFLOW = ".github/workflows/selfhost-sync.yml";
++const ANCHOR_TAG = "selfhost-pre-sync";
++const NPM = process.platform === "win32" ? "npm.cmd" : "npm";
++
++function arg(name, fallback) {
++  const i = process.argv.indexOf(`--${name}`);
++  if (i < 0) return fallback;
++  const v = process.argv[i + 1];
++  return v && !v.startsWith("--") ? v : fallback;
++}
++const FLAG = (n) => process.argv.includes(`--${n}`);
++
++const REMOTE = arg("remote", "upstream");
++const BRANCH = arg("branch", "main");
++const DRY = FLAG("check-only");
++/** 同步成功并通过校验后，是否推送到 origin（你自己的 fork）。默认关闭，避免误推。 */
++const PUSH = FLAG("push");
++const SKIP_VERIFY = FLAG("skip-verify");
++
++function git(args, opts = {}) {
++  return execFileSync("git", args, {
++    cwd: ROOT,
++    encoding: opts.raw ? "buffer" : "utf8",
++    maxBuffer: 256 * 1024 * 1024,
++    stdio: ["ignore", "pipe", opts.quiet ? "ignore" : "pipe"],
++  });
++}
++/**
++ * 取 NUL 分隔列表。
++ * 注意：`-z` 必须紧跟子命令，绝不能写在末尾 —— 一旦命令行里有 `--` pathspec，
++ * 末尾的 `-z` 会被 git 当作**路径参数**，导致结果只剩极少数条目（踩过）。
++ */
++function gitZ(args) {
++  const withZ = [args[0], "-z", ...args.slice(1)];
++  return execFileSync("git", withZ, { cwd: ROOT, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 })
++    .split("\0")
++    .filter(Boolean);
++}
++function run(cmd, args) {
++  return execFileSync(cmd, args, { cwd: ROOT, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
++}
++function npmRun(args) {
++  return execFileSync(NPM, args, {
++    cwd: ROOT,
++    stdio: "inherit",
++    shell: process.platform === "win32",
++  });
++}
++
++function log(s) {
++  process.stdout.write(`${s}\n`);
++}
++function step(s) {
++  log(`\n▸ ${s}`);
++}
++
++function die(msg, hint) {
++  console.error(`\n✗ ${msg}`);
++  if (hint) console.error(hint);
++  process.exit(1);
++}
++
++/** 回滚指引：改动尚未提交，锚点 tag 保留着同步前的完整状态 */
++function printRollback(note) {
++  console.error(
++    [
++      "",
++      "── 如何回滚到同步前 ──",
++      `  git reset --hard ${ANCHOR_TAG}     # 恢复同步前的代码状态`,
++      "  git clean -fd                  # 清掉同步过程中新增的未跟踪文件",
++      "",
++      `  （${note}）`,
++      `  锚点 tag ${ANCHOR_TAG} 会一直保留，确认无问题后可删除：git tag -d ${ANCHOR_TAG}`,
++    ].join("\n")
++  );
++}
++
++/** 前置：工作区必须干净 */
++function ensureClean() {
++  const dirty = git(["status", "--porcelain"]).trim();
++  if (!dirty) return;
++  const lines = dirty.split("\n");
++  die(
++    `工作区不干净，无法安全同步（有 ${lines.length} 项未提交改动）。`,
++    [
++      "",
++      "为什么要拦：同步的第一步是 `git checkout -B <分支> <上游>`，它要求工作区干净；",
++      "若强行进行，未提交的改动会被上游版本覆盖。请先提交：",
++      "",
++      "  npm run selfhost:export        # 确保叠加层是最新的（关键！）",
++      "  npm run selfhost:guard         # 自查",
++      "  git add -A && git commit -m \"chore(selfhost): snapshot before upstream sync\"",
++      "",
++      "然后再跑本脚本。",
++      "",
++      "当前未提交项（前 10 条）：",
++      ...lines.slice(0, 10).map((l) => `  ${l}`),
++    ].join("\n")
++  );
++}
++
++function ensureRemote() {
++  const remotes = git(["remote"]).split("\n").map((s) => s.trim()).filter(Boolean);
++  if (!remotes.includes(REMOTE)) {
++    die(
++      `未配置远端「${REMOTE}」。`,
++      [
++        "",
++        'origin 通常指向作者本人的仓库（你无写权限），建议另加一个 upstream 指向它：',
++        "",
++        `  git remote add ${REMOTE} https://github.com/wu529778790/parse.shenzjd.com.git`,
++        "",
++        `当前已有远端：${remotes.join(", ") || "(无)"}`,
++      ].join("\n")
++    );
++  }
++}
++
++function main() {
++  log(`仓库：${ROOT}`);
++
++  step("检查前置条件");
++  ensureClean();
++  ensureRemote();
++  const patchDir = path.join(ROOT, "selfhost", "patches");
++  if (!existsSync(patchDir)) die("缺少 selfhost/patches，请先运行 npm run selfhost:export");
++  const patches = existsSync(patchDir)
++    ? readdirSync(patchDir).filter((f) => f.endsWith(".patch")).sort()
++    : [];
++  if (!patches.length) die("selfhost/patches 下没有补丁，无法重建自建改造");
++  if (!existsSync(path.join(ROOT, "selfhost", "delete.txt"))) die("缺少 selfhost/delete.txt");
++  log(`  ✓ 工作区干净 · 远端 ${REMOTE} · 补丁 ${patches.join(", ")}`);
++
++  step(`拉取上游 ${REMOTE}/${BRANCH}`);
++  git(["fetch", "--prune", REMOTE, BRANCH], { quiet: true });
++  const upstreamRef = `${REMOTE}/${BRANCH}`;
++  const upstreamSha = git(["rev-parse", upstreamRef]).trim();
++  const localSha = git(["rev-parse", "HEAD"]).trim();
++  const baseSha = git(["merge-base", "HEAD", upstreamRef]).trim();
++
++  log(`  本地 HEAD   : ${localSha.slice(0, 10)}`);
++  log(`  上游 HEAD   : ${upstreamSha.slice(0, 10)}`);
++  if (upstreamSha === localSha) {
++    log("\n✓ 上游没有新提交，无需同步。");
++    process.exit(0);
++  }
++  const newCount = git(["rev-list", "--count", `${localSha}..${upstreamSha}`]).trim();
++  log(`  上游新增提交: ${newCount} 个（共同祖先 ${baseSha.slice(0, 10)}）`);
++
++  if (DRY) {
++    log("\n--check-only：仅检查，未做任何改动。上游有更新，去掉 --check-only 即可执行同步。");
++    process.exit(0);
++  }
++
++  step(`打回滚锚点 tag ${ANCHOR_TAG}`);
++  git(["tag", "-f", ANCHOR_TAG, "HEAD"]);
++  log(`  ✓ ${ANCHOR_TAG} → ${localSha.slice(0, 10)}`);
++
++  // 叠加层必须在重置前取出来 —— 重置到上游会把 selfhost/ 一并清掉
++  step("备份叠加层");
++  const overlayBackup = mkdtempSync(path.join(os.tmpdir(), "selfhost-overlay-"));
++  cpSync(path.join(ROOT, "selfhost"), path.join(overlayBackup, "selfhost"), { recursive: true });
++  log(`  ✓ 已备份到 ${overlayBackup}`);
++
++  const branch = git(["rev-parse", "--abbrev-ref", "HEAD"]).trim();
++
++  step(`重置工作区到上游（${branch} → ${upstreamRef}）`);
++  try {
++    git(["checkout", "-B", branch, upstreamRef]);
++  } catch (e) {
++    die("重置失败。", `${e.stderr?.toString() || e.message}\n`);
++  }
++  log(`  ✓ 现为 ${git(["rev-parse", "--short", "HEAD"]).trim()}`);
++
++  step("贴回叠加层");
++  cpSync(path.join(overlayBackup, "selfhost"), path.join(ROOT, "selfhost"), { recursive: true });
++  const patchTmp = mkdtempSync(path.join(os.tmpdir(), "selfhost-patch-"));
++  for (const p of patches) {
++    try {
++      // 应用前必须剥掉 CR：Windows 上 core.autocrlf=true 会把检出的 .patch 转成 CRLF，
++      // 而 git apply 对行尾敏感 —— 会以「patch failed / does not apply」大面积失败，
++      // 且现象极具误导性（工作区明明是纯净上游）。.gitattributes 的 `*.patch -text`
++      // 已从源头避免，这里是防御性兜底，兼容在该文件加入之前就已存在的检出。
++      const src = path.join(ROOT, "selfhost", "patches", p);
++      const normalized = path.join(patchTmp, p.replace(/[\\/]/g, "_"));
++      const raw = readFileSync(src, "utf8");
++      const crCount = (raw.match(/\r/g) || []).length;
++      if (crCount) log(`  · ${p} 检出为 CRLF（${crCount} 处 CR），已自动归一化为 LF`);
++      writeFileSync(normalized, raw.replace(/\r\n/g, "\n"), "utf8");
++      git(["apply", "--3way", "--whitespace=nowarn", normalized]);
++      log(`  ✓ 应用 ${p}`);
++    } catch (e) {
++      const detail = (e.stderr?.toString?.() || e.message || "").trim();
++      console.error(`\n✗ 补丁应用失败：${p}\n${detail}\n`);
++      try {
++        const conflicts = git(["diff", "--name-only", "--diff-filter=U"]).trim();
++        if (conflicts) {
++          console.error("冲突文件：");
++          for (const f of conflicts.split("\n")) console.error(`  ${f}`);
++          console.error(
++            "\n这通常意味着：上游改动了你也在改的同一段代码。处理方式——\n" +
++              "  1) 保持当前状态，手工解决冲突（文件里已写入 <<<<<<< ======= >>>>>>> 标记）\n" +
++              "  2) 解决后运行：npm run selfhost:guard && npm run selfhost:verify\n" +
++              "  3) 通过后：npm run selfhost:export && git add -A && git commit\n" +
++              "  4) 不想折腾就按下面的命令整树回滚"
++          );
++        }
++      } catch {
++        /* 忽略 */
++      }
++      printRollback("本次未产生任何提交");
++      process.exit(1);
++    }
++  }
++
++  step("执行删除清单");
++  const delLines = readFileSync(path.join(ROOT, "selfhost", "delete.txt"), "utf8").split(/\r?\n/);
++  let removed = 0;
++  for (const raw of delLines) {
++    const l = raw.trim();
++    if (!l || l.startsWith("#")) continue;
++    try {
++      git(["rm", "-rf", "-q", "-f", "--ignore-unmatch", "--", l]);
++      removed++;
++    } catch {
++      /* 上游可能已删除 */
++    }
++  }
++  log(`  ✓ 处理 ${removed} 项`);
++
++  step("固定 .github/workflows 为同步前版本");
++  const pinFiles = gitZ(["ls-tree", "-r", "--name-only", ANCHOR_TAG, "--", ".github/workflows"]);
++  for (const f of pinFiles) {
++    if (f === OWN_WORKFLOW) continue;
++    writeFileSync(path.join(ROOT, f), git(["show", `${ANCHOR_TAG}:${f}`], { raw: true }));
++  }
++  for (const f of gitZ(["ls-tree", "-r", "--name-only", "HEAD", "--", ".github/workflows"])) {
++    if (f === OWN_WORKFLOW) continue;
++    if (!pinFiles.includes(f)) {
++      rmSync(path.join(ROOT, f), { force: true });
++      log(`  · 移除上游新增工作流 ${f}`);
++    }
++  }
++  log(`  ✓ 已固定 ${pinFiles.length - 1} 个文件`);
++
++  step("不变量守卫");
++  try {
++    process.stdout.write(run(process.execPath, ["scripts/selfhost-guard.mjs"]));
++  } catch (e) {
++    console.error(e.stdout?.toString() || "");
++    console.error(e.stderr?.toString() || "");
++    console.error(
++      "\n✗ 守卫未通过：上游很可能在别处重新引入了被剥离的第三方依赖/认证。\n" +
++        "  处理：按上面的违规项定位并清理，或放弃本次同步。"
++    );
++    printRollback("本次未产生任何提交");
++    process.exit(1);
++  }
++
++  step("等价性验证");
++  try {
++    process.stdout.write(run(process.execPath, ["scripts/verify-overlay.mjs"]));
++  } catch (e) {
++    console.error(e.stdout?.toString() || "");
++    console.error(e.stderr?.toString() || "");
++    console.error("\n✗ 等价性验证未通过：叠加层无法完整重建改造结果（通常是补丁漏收录文件）。");
++    printRollback("本次未产生任何提交");
++    process.exit(1);
++  }
++
++  if (!SKIP_VERIFY) {
++    step("重生成锁文件（package.json 已改动，锁文件是派生产物不进补丁）");
++    run(NPM, ["install", "--package-lock-only", "--ignore-scripts", "--no-audit", "--no-fund"]);
++
++    step("安装依赖并测试、构建（耗时较长）");
++    try {
++      npmRun(["ci"]);
++      npmRun(["test"]);
++      npmRun(["run", "build"]);
++    } catch {
++      console.error("\n✗ 安装/测试/构建失败：上游改动与自建改造不兼容。");
++      printRollback("本次未产生任何提交");
++      process.exit(1);
++    }
++  } else {
++    log("\n（--skip-verify：已跳过 npm ci / test / build）");
++  }
++
++  step("提交");
++  git(["add", "-A"]);
++  let changed = true;
++  try {
++    git(["diff", "--cached", "--quiet"]);
++    changed = false;
++  } catch {
++    changed = true;
++  }
++  if (!changed) {
++    log("  与上游无差异，无需提交。");
++  } else {
++    const short = upstreamSha.slice(0, 7);
++    git(["commit", "-q", "-m", `chore(selfhost): reapply overlay on upstream ${short}`]);
++    log(`  ✓ 已提交 ${git(["rev-parse", "--short", "HEAD"]).trim()}`);
++  }
++
++  rmSync(overlayBackup, { recursive: true, force: true });
++  rmSync(patchTmp, { recursive: true, force: true });
++
++  // 可选：推送回 origin（你自己的 fork）。
++  // 同步会重写分支历史（= 上游 + 重放叠加层），与远端旧线不构成快进，
++  // 因此用 --force-with-lease：若远端在你同步期间被推过，它会拒绝覆盖而非误伤。
++  if (PUSH) {
++    const branch = git(["rev-parse", "--abbrev-ref", "HEAD"]).trim();
++    log(`\n  → 推送到 origin（${branch}，--force-with-lease）…`);
++    try {
++      git(["push", "--force-with-lease", "origin", `HEAD:${branch}`]);
++      log("  ✓ 已推送到 origin（你的 fork）");
++    } catch (e) {
++      log("  ✗ 推送失败：");
++      log(String(e.stderr || e.message).trim());
++      log("    提示：远端若在你同步期间有新提交，--force-with-lease 会拒绝覆盖；请重新拉取后再试。");
++      log("    另：若远端凭据走 Git for Windows 的 helper-selector 卡住，可临时加");
++      log("        git -c credential.helper= -c credential.helper=store push ...");
++      process.exitCode = 1;
++    }
++  }
++
++  const followUps = [
++    "  · 确认无问题后可删锚点：git tag -d " + ANCHOR_TAG,
++    "  · 交给 GitHub Actions 自动同步更省心：.github/workflows/selfhost-sync.yml（每天 03:00 UTC）",
++    "  · 部署更新：按 改造说明.md 第 8 章（Docker 或 systemd）",
++  ];
++  if (!PUSH) {
++    followUps.unshift(
++      "  · 想发布到你的 fork（origin）：",
++      "      node scripts/sync-upstream.mjs --push",
++      "      或：git push --force-with-lease origin HEAD:main"
++    );
++  }
++
++  log(
++    [
++      "",
++      "────────────────────────────────────────────",
++      PUSH ? "✓ 同步完成，已推送到 origin（你的 fork）" : "✓ 同步完成（仅提交到本地分支，未推送）",
++      "",
++      "后续：",
++      ...followUps,
++    ].join("\n")
++  );
++}
++
++main();
+diff --git a/scripts/verify-overlay.mjs b/scripts/verify-overlay.mjs
+new file mode 100644
+index 0000000..dafc989
+--- /dev/null
++++ b/scripts/verify-overlay.mjs
+@@ -0,0 +1,312 @@
++#!/usr/bin/env node
++/**
++ * 叠加层等价性验证：证明「重置到上游 + 重放叠加层」能 1:1 重建当前改造结果。
++ *
++ * 为什么需要它：`.github/workflows/selfhost-sync.yml` 每天都在做这件事，但只有真正
++ * 跑到 GitHub 上才会发现叠加层不完整（漏文件、漏删除项）。本地一键验证可以把问题
++ * 提前暴露，而不是等同步任务把改造重置掉。
++ *
++ * 做法（与工作流同序）：
++ *   ① 在临时目录建一个指向上游基线的干净 worktree（基线 = merge-base HEAD upstream/main）
++ *   ② 取回 selfhost/ 叠加层，`git apply --3way` 应用补丁
++ *   ③ 执行 delete.txt 里的删除
++ *   ④ 固定 .github/workflows 为「当前版本」（等价于工作流里 LAST = 上一个正常版本）
++ *   ⑤ 两侧各算一次 `git write-tree`，比对目录树哈希
++ *
++ * 用法：node scripts/verify-overlay.mjs
++ * 退出码：0 等价；1 不等价（列出差异路径）
++ *
++ * ⚠️ 两个容易误判的点，脚本已内置处理：
++ *   · 派生产物（package-lock.json）**必然不同** —— 它按设计被排除出补丁，
++ *     由同步工作流用 `npm install --package-lock-only` 重建。属预期，不算失败。
++ *   · 文件模式（可执行位）—— Windows 上 `core.fileMode=false`，若用**全新的空索引**
++ *     直接 `git add -A`，git 会从文件系统重新登记权限，把 100755 降成 100644，
++ *     产生「1 file changed, 0 insertions, 0 deletions」的伪差异。因此本脚本坚持
++ *     「先 `git read-tree <基线>` 再 `git add -A`」。两侧必须用**同一个基线**，
++ *     否则「已提交」场景下 HEAD（含改造）与上游基线的文件模式来源不同，会产生伪差异。
++ */
++
++import { execFileSync } from "node:child_process";
++import { readFileSync, readdirSync, rmSync, writeFileSync, existsSync } from "node:fs";
++import { cp, mkdtemp } from "node:fs/promises";
++import os from "node:os";
++import path from "node:path";
++import { fileURLToPath } from "node:url";
++import { resolveBase, fallbackWarning, degradedWarning } from "./lib/selfhost-base.mjs";
++
++const ROOT = path.resolve(path.join(path.dirname(fileURLToPath(import.meta.url)), ".."));
++
++/** 与 scripts/export-overlay.mjs 的 DERIVED_PATHS 保持一致 */
++const DERIVED_PATHS = ["package-lock.json"];
++
++/** 本叠加层自有的工作流，不参与「固定上游工作流」步骤 */
++const OWN_WORKFLOW = ".github/workflows/selfhost-sync.yml";
++
++function git(args, opts = {}) {
++  return execFileSync("git", args, {
++    cwd: opts.cwd || ROOT,
++    encoding: "utf8",
++    maxBuffer: 64 * 1024 * 1024,
++    env: { ...process.env, ...(opts.env || {}) },
++    stdio: opts.stdio || ["ignore", "pipe", "pipe"],
++  });
++}
++
++/** 取路径列表（NUL 分隔）：避免 core.quotePath=true 把非 ASCII 路径转义 */
++function gitPaths(args, cwd) {
++  const out = execFileSync("git", [...args, "-z"], {
++    cwd: cwd || ROOT,
++    encoding: "utf8",
++    maxBuffer: 64 * 1024 * 1024,
++  });
++  return out.split("\0").filter(Boolean);
++}
++
++/**
++ * 用「临时索引」计算某个工作树的目录树哈希。
++ * 关键：必须先 read-tree 载入**基线**的索引内容（携带正确的文件模式），再 add -A。
++ * 若省掉 read-tree（或用一个全新的空索引），Windows 上会丢失可执行位。
++ *
++ * 同时返回 `normalized`：把派生产物（锁文件）从索引里摘掉后重新 write-tree 得到的哈希。
++ * 拿它去比对，等价性就是一个可直接引用的单一数值，而不是「两个哈希不同、但只差一个
++ * 已解释的文件」。
++ */
++function treeHash({ repo, indexPath, base }) {
++  if (existsSync(indexPath)) rmSync(indexPath, { force: true });
++  const env = { GIT_INDEX_FILE: indexPath };
++  git(["read-tree", base], { cwd: repo, env });
++  git(["add", "-A"], { cwd: repo, env, stdio: ["ignore", "ignore", "pipe"] });
++  let normalized;
++  try {
++    git(["rm", "--cached", "-q", "--force", "--ignore-unmatch", "--", ...DERIVED_PATHS], {
++      cwd: repo,
++      env,
++    });
++    normalized = git(["write-tree"], { cwd: repo, env }).trim();
++  } catch {
++    normalized = null;
++  }
++  // 摘掉派生产物后再取完整树哈希，避免影响后续 diff
++  git(["read-tree", base], { cwd: repo, env });
++  git(["add", "-A"], { cwd: repo, env, stdio: ["ignore", "ignore", "pipe"] });
++  const tree = git(["write-tree"], { cwd: repo, env }).trim();
++  rmSync(indexPath, { force: true });
++  return { tree, normalized };
++}
++
++/** 列出目录树里 path -> blob 哈希（忽略 mode，用于内容级比对） */
++function blobIndex(tree, cwd) {
++  const out = git(["ls-tree", "-r", tree], { cwd });
++  const map = new Map();
++  for (const line of out.split("\n")) {
++    if (!line.trim()) continue;
++    // <mode> <type> <hash>\t<path>
++    const tab = line.indexOf("\t");
++    if (tab < 0) continue;
++    const meta = line.slice(0, tab).split(/\s+/);
++    map.set(line.slice(tab + 1), { mode: meta[0], hash: meta[2] });
++  }
++  return map;
++}
++
++async function main() {
++  const tmpRoot = os.tmpdir();
++  const sim = await mkdtemp(path.join(tmpRoot, "verify-overlay-"));
++  const idxMain = path.join(tmpRoot, `verify-idx-${process.pid}.main`);
++  const idxSim = path.join(tmpRoot, `verify-idx-${process.pid}.sim`);
++  let worktreeAdded = false;
++
++  try {
++    // ---- 0) 前置：解析上游基线，且叠加层存在 ----
++    const patchDir = path.join(ROOT, "selfhost", "patches");
++    if (!existsSync(patchDir)) throw new Error("缺少 selfhost/patches，请先运行 npm run selfhost:export");
++    const patchFiles = readdirSync(patchDir)
++      .filter((f) => f.endsWith(".patch"))
++      .sort();
++    if (!patchFiles.length) throw new Error("selfhost/patches 下没有补丁");
++
++    // ---- 0.5) 补丁可移植性 ----
++    // 判据是**仓库里的 blob** 必须为纯 LF —— CI 在 Linux 上检出并 `git apply`，
++    // CRLF 会让上下文匹配失败。本地工作区可能是 CRLF：Windows 的 core.autocrlf=true
++    // 会转换检出内容；.gitattributes 的 `*.patch -text` 已禁止该转换，若尚未生效
++    // （在加入该文件之前克隆的仓库），应用前会自动归一化，不影响正确性，故只提示不失败。
++    for (const p of patchFiles) {
++      const rel = `selfhost/patches/${p}`;
++      let blob = null;
++      try {
++        blob = git(["show", `HEAD:${rel}`]);
++      } catch {
++        blob = null; // 尚未提交
++      }
++      const probe = blob ?? readFileSync(path.join(patchDir, p), "utf8");
++      const crlf = (probe.match(/\r\n/g) || []).length;
++      if (crlf > 0 && blob) {
++        console.error(
++          `✗ ${rel} 的仓库 blob 含 ${crlf} 处 CRLF：CI 上 git apply 会失败或写出 CRLF 文件。\n` +
++            `  修复：确认 .gitattributes 含 \`*.patch -text\`，然后重新提交该补丁。`
++        );
++        return 1;
++      }
++      if (crlf > 0) {
++        console.log(`  · ${p} 工作区为 CRLF（${crlf} 行，尚未提交），应用前会自动归一化为 LF`);
++      } else {
++        console.log(`  ✓ ${p} 为纯 LF（${blob ? "仓库 blob" : "工作区文件"}）`);
++      }
++    }
++
++    const deleteFile = path.join(ROOT, "selfhost", "delete.txt");
++    if (!existsSync(deleteFile)) throw new Error("缺少 selfhost/delete.txt");
++
++    console.log(`补丁: ${patchFiles.join(", ")}`);
++
++    // 差异基线 = 上游提交（不是 HEAD）：补丁是「相对上游」生成的，
++    // 临时工作树必须建立在同一基线上，否则「新增文件」会被重复添加而冲突。
++    const { base, ref: baseRef, fallback, degraded } = resolveBase(ROOT);
++    if (fallback) console.warn(fallbackWarning(ROOT));
++    if (degraded) console.warn(degradedWarning(baseRef));
++    console.log(`差异基线: ${baseRef} → ${base.slice(0, 10)}`);
++
++    // ---- 1) 建干净 worktree（基于上游基线）----
++    rmSync(sim, { recursive: true, force: true });
++    git(["worktree", "add", "--detach", "--force", sim, base], { stdio: ["ignore", "pipe", "pipe"] });
++    worktreeAdded = true;
++
++    // ---- 2) 取回叠加层并应用补丁 ----
++    await cp(path.join(ROOT, "selfhost"), path.join(sim, "selfhost"), { recursive: true });
++    // 应用前剥离 CR：Windows 上 core.autocrlf=true 会把检出的 .patch 转成 CRLF，
++    // git apply 对行尾敏感 → 会误报「patch does not apply」。.gitattributes 的
++    // `*.patch -text` 从源头避免，这里是兜底（兼容既有检出）。
++    // 归一化后的副本写在临时目录，绝不能写进 sim 工作树 —— 那会多出一个未跟踪文件，
++    // 破坏随后的目录树比对。
++    const patchTmp = await mkdtemp(path.join(os.tmpdir(), "verify-patch-"));
++    for (const p of patchFiles) {
++      const raw = readFileSync(path.join(patchDir, p), "utf8");
++      const crCount = (raw.match(/\r/g) || []).length;
++      const normalized = path.join(patchTmp, p);
++      writeFileSync(normalized, raw.replace(/\r\n/g, "\n"), "utf8");
++      git(["apply", "--3way", "--whitespace=nowarn", normalized], {
++        cwd: sim,
++        stdio: ["ignore", "pipe", "pipe"],
++      });
++      console.log(`  ✓ 应用 ${p}${crCount ? `（检出为 CRLF，已自动归一化为 LF）` : ""}`);
++    }
++    rmSync(patchTmp, { recursive: true, force: true });
++
++    // ---- 3) 执行删除清单 ----
++    const lines = readFileSync(deleteFile, "utf8").split(/\r?\n/);
++    let removed = 0;
++    for (const raw of lines) {
++      const l = raw.trim();
++      if (!l || l.startsWith("#")) continue;
++      try {
++        git(["rm", "-rf", "-q", "-f", "--ignore-unmatch", "--", l], { cwd: sim });
++        removed++;
++      } catch {
++        /* 上游可能已删除该路径，忽略 */
++      }
++    }
++    console.log(`  ✓ 删除 ${removed} 项`);
++
++    // ---- 4) 固定 .github/workflows 为「当前版本」----
++    // 枚举集合 = sim 现有工作流 ∪ 本仓库工作区现有工作流。
++    // 取「本仓库工作区」而非 `ls-tree HEAD`：改造尚未提交时 HEAD 仍指向上游，
++    // 会漏掉新增工作流；工作区枚举在「已提交 / 未提交」两种场景下都成立。
++    const wfDir = path.join(ROOT, ".github", "workflows");
++    const ownWf = existsSync(wfDir)
++      ? readdirSync(wfDir).map((f) => `.github/workflows/${f}`)
++      : [];
++    const wfFiles = gitPaths(["ls-files", ".github/workflows"], sim).concat(ownWf);
++    for (const f of new Set(wfFiles)) {
++      if (f === OWN_WORKFLOW) continue;
++      const src = path.join(ROOT, f);
++      if (existsSync(src)) {
++        await cp(src, path.join(sim, f));
++      } else {
++        rmSync(path.join(sim, f), { force: true });
++        try {
++          git(["rm", "-q", "-f", "--ignore-unmatch", "--", f], { cwd: sim });
++        } catch {
++          /* 不存在则跳过 */
++        }
++      }
++    }
++
++    // ---- 5) 两侧树哈希（同一基线，保证文件模式来源一致）----
++    const simT = treeHash({ repo: sim, indexPath: idxSim, base: base });
++    const wtT = treeHash({ repo: ROOT, indexPath: idxMain, base: base });
++    const treeSim = simT.tree;
++    const treeWt = wtT.tree;
++    console.log(`\n改造后工作区 tree: ${treeWt}`);
++    console.log(`叠加层重放 tree  : ${treeSim}`);
++    console.log(`归一化（排除 ${DERIVED_PATHS.join(", ")}）:`);
++    console.log(`  工作区: ${wtT.normalized}`);
++    console.log(`  重放  : ${simT.normalized}`);
++
++    // ---- 6) 判定 ----
++    const diffPaths = git(["diff", "--name-only", treeWt, treeSim]).split("\n").filter(Boolean);
++    const unexpected = diffPaths.filter((p) => !DERIVED_PATHS.some((d) => p === d || p.startsWith(`${d}/`)));
++
++    const a = blobIndex(treeWt, ROOT);
++    const b = blobIndex(treeSim, ROOT);
++    const onlyA = [...a.keys()].filter((k) => !b.has(k));
++    const onlyB = [...b.keys()].filter((k) => !a.has(k));
++    let contentDiff = 0;
++    let modeDiff = 0;
++    for (const [p, x] of a) {
++      const y = b.get(p);
++      if (!y) continue;
++      if (x.hash !== y.hash) contentDiff++;
++      if (x.mode !== y.mode) modeDiff++;
++    }
++
++    console.log(`\n文件数: 工作区 ${a.size} / 重放 ${b.size}`);
++    console.log(`仅工作区独有: ${onlyA.length} | 仅重放独有: ${onlyB.length}`);
++    console.log(`内容不同: ${contentDiff}（期望恰为派生产物 ${DERIVED_PATHS.length} 个）| 仅模式不同: ${modeDiff}`);
++
++    const ok =
++      unexpected.length === 0 &&
++      onlyA.length === 0 &&
++      onlyB.length === 0 &&
++      modeDiff === 0 &&
++      simT.normalized !== null &&
++      simT.normalized === wtT.normalized;
++    if (ok) {
++      console.log(
++        `\n✓ 等价：叠加层可 1:1 重建改造结果\n` +
++          `  归一化 tree 哈希（两侧一致）: ${wtT.normalized}\n` +
++          `  唯一差异为派生产物 ${DERIVED_PATHS.join(", ")}，由同步工作流用 npm install --package-lock-only 重建`
++      );
++      return 0;
++    }
++    console.error("\n✗ 不等价，叠加层无法完整重建改造结果：");
++    if (onlyA.length) console.error(`  · 仅工作区存在（补丁漏收录？）: ${onlyA.slice(0, 20).join(", ")}`);
++    if (onlyB.length) console.error(`  · 仅重放存在（多余收录？）: ${onlyB.slice(0, 20).join(", ")}`);
++    if (unexpected.length) console.error(`  · 非派生文件内容/模式不同: ${unexpected.slice(0, 20).join(", ")}`);
++    if (modeDiff) console.error(`  · 文件模式不同: ${modeDiff} 个（Windows 上常见，CI 为 Linux 时不复现）`);
++    console.error("\n处理：确认改动已提交前运行 `npm run selfhost:export` 重新导出叠加层。");
++    return 1;
++  } finally {
++    rmSync(idxMain, { force: true });
++    rmSync(idxSim, { force: true });
++    if (worktreeAdded) {
++      try {
++        git(["worktree", "remove", "--force", sim], { stdio: ["ignore", "ignore", "ignore"] });
++      } catch {
++        /* 已不存在 */
++      }
++      try {
++        git(["worktree", "prune"], { stdio: ["ignore", "ignore", "ignore"] });
++      } catch {
++        /* 忽略 */
++      }
++    }
++    rmSync(sim, { recursive: true, force: true });
++  }
++}
++
++main()
++  .then((code) => process.exit(code))
++  .catch((err) => {
++    console.error(`验证脚本出错: ${err.stdout?.toString?.() || err.message}`);
++    process.exit(2);
++  });
+diff --git a/src/app/api/config/route.js b/src/app/api/config/route.js
+index 1e76270..f406adb 100644
+--- a/src/app/api/config/route.js
++++ b/src/app/api/config/route.js
+@@ -5,8 +5,8 @@ export const runtime = "nodejs";
+ /**
+  * 功能开关配置接口（供小程序等客户端远程读取，决定是否展示视频解析入口）。
+  * 小程序审核期间不配置 VIDEO_PARSE_ENABLED，videoParseEnabled 返回 false
+- * 隐藏解析功能；审核通过后把该变量设为 "true"（wrangler.toml [vars] 或
+- * Worker 的 Settings → Variables）重新部署即可放开，未配置时默认关闭。
++ * 隐藏解析功能；审核通过后把该变量设为 "true"（宿主机 .env 中写
++ * VIDEO_PARSE_ENABLED=true）重建容器即可放开，未配置时默认关闭。
+  */
+ export async function GET(request) {
+   const corsHeaders = getCorsHeaders(request?.headers?.get("origin") || "");
+diff --git a/src/app/api/stats/route.js b/src/app/api/stats/route.js
+index e483817..ec0e14b 100644
+--- a/src/app/api/stats/route.js
++++ b/src/app/api/stats/route.js
+@@ -1,28 +1,37 @@
+ import { queryStats } from "@/lib/analytics";
+ import { getCorsHeaders } from "@/lib/api-utils";
+-import { getWxAuthUser } from "@/lib/wx-auth-guard";
+ 
+ export const runtime = "nodejs";
+ 
+ /**
+  * 解析行为统计接口（只读）。
+- * 鉴权：复用微信登录态（wxauth-token），仅管理员（用户表 is_admin 标记）可访问。
++ *
++ * 【改造说明】原鉴权复用第三方微信登录态（wxauth-token + 远程 userinfo 的 isAdmin），
++ * 随认证模块一并移除。现改为站点自有密钥鉴权：请求头携带
++ * `Authorization: Bearer <STATS_API_KEY>`。未配置 STATS_API_KEY 时本接口关闭（503），
++ * 与「统计库未配置则记录功能自动禁用」的口径一致。
++ *
+  * 返回：按平台 / 按天（近 14 天）聚合 + 总量 / 独立访客（IP 匿名哈希）/ 独立链接数。
+  */
+ export async function GET(request) {
+   const corsHeaders = getCorsHeaders(request.headers.get("origin") || "");
+ 
+-  const user = await getWxAuthUser(request);
+-  if (!user.authenticated) {
++  const expectedKey = process.env.STATS_API_KEY;
++  if (!expectedKey) {
+     return Response.json(
+-      { code: 401, msg: "请先完成微信登录" },
+-      { status: 401, headers: corsHeaders }
++      { code: 503, msg: "统计接口未启用（未配置 STATS_API_KEY）" },
++      { status: 503, headers: corsHeaders }
+     );
+   }
+-  if (!user.isAdmin) {
++
++  const authorization = request.headers.get("authorization") || "";
++  const match = authorization.match(/^\s*bearer\s+(.+)$/i);
++  const providedKey = match ? match[1].trim() : "";
++
++  if (!providedKey || !timingSafeEqual(providedKey, expectedKey)) {
+     return Response.json(
+-      { code: 403, msg: "仅管理员可访问" },
+-      { status: 403, headers: corsHeaders }
++      { code: 401, msg: "鉴权失败，请携带有效的 Authorization: Bearer <STATS_API_KEY>" },
++      { status: 401, headers: corsHeaders }
+     );
+   }
+ 
+@@ -36,3 +45,16 @@ export async function GET(request) {
+ 
+   return Response.json({ code: 200, msg: "ok", data: stats }, { headers: corsHeaders });
+ }
++
++/**
++ * 定长比较，避免逐字符短路比较泄漏密钥前缀信息。
++ * 长度不同时仍走完整轮次，仅返回 false。
++ */
++function timingSafeEqual(a, b) {
++  const len = Math.max(a.length, b.length);
++  let diff = a.length === b.length ? 0 : 1;
++  for (let i = 0; i < len; i++) {
++    diff |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
++  }
++  return diff === 0;
++}
+diff --git a/src/app/globals.css b/src/app/globals.css
+index e8585f9..a19efba 100644
+--- a/src/app/globals.css
++++ b/src/app/globals.css
+@@ -94,11 +94,6 @@
+     overflow-x: hidden;
+   }
+ 
+-  /* 顶部导航 Web Component：custom element 默认 display:inline，显式改为 block 参与文档流 */
+-  site-navbar {
+-    display: block;
+-  }
+-
+   /* Custom Scrollbar */
+   ::-webkit-scrollbar {
+     width: 8px;
+diff --git a/src/app/layout.tsx b/src/app/layout.tsx
+index 109ccaf..84b2ea7 100644
+--- a/src/app/layout.tsx
++++ b/src/app/layout.tsx
+@@ -91,23 +91,14 @@ export default function RootLayout({
+     <html lang="zh-CN" className="scroll-smooth">
+       <head>
+         <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+-        <link rel="icon" type="image/svg+xml" href="https://cdn.jsdmirror.com/gh/wu529778790/img.shenzjd.com@master/blog/imgx-20260828-215653-2ha5.svg" />
+-        <link rel="apple-touch-icon" href="https://cdn.jsdmirror.com/gh/wu529778790/img.shenzjd.com@master/blog/imgx-20260828-220754-822r.png" />
+-        {/* 右侧悬浮公众号+赞赏码浮窗：@wu529778790/floating-qr Web Component 版
+-            一行 <script> 引入，自动注册 <floating-qr> 并注入默认浮窗（right-center，
+-            默认隐藏移动端、关闭后刷新重现），无需额外标签/JS */}
+-        <script
+-          src="https://unpkg.com/@wu529778790/floating-qr@latest/dist/floating-qr.wc.js"
+-          defer
+-        />
+-        {/* 顶部导航 + 头像浮窗：@wu529778790/site-navbar Web Component 版
+-            一条 JS 引入，组件内部自动加载并初始化 wx-auth-sdk（静默校验登录态），
+-            无需手动引 SDK、无需写 WxAuth.init()。body 顶部放一个 <site-navbar> 标签即出现整条导航。
+-            解析主流程的登录弹窗由 src/lib/wx-auth-client.ts 复用同一全局 window.WxAuth 实例触发 */}
+-        <script
+-          src="https://unpkg.com/@wu529778790/site-navbar@latest/dist/site-navbar.wc.js"
+-          defer
+-        />
++        {/* 【改造说明】原页面在此引入作者托管在 unpkg 的两个 Web Component：
++            @wu529778790/floating-qr（公众号 + 赞赏码浮窗）与
++            @wu529778790/site-navbar（顶部导航，内部会自动初始化 third-party 微信
++            登录 SDK 并静默校验登录态）。二者均为 @latest 不锁版本的第三方脚本，
++            运行在自有域名下并持有 Cookie 写入能力，属于供应链风险与站外依赖，
++            已整体移除。图标改由本站 public/brand/ 提供，不再外链作者 CDN。 */}
++        <link rel="icon" type="image/svg+xml" href="/brand/logo-mark.svg" />
++        <link rel="apple-touch-icon" href="/brand/logo-mark.svg" />
+         <script
+           type="application/ld+json"
+           dangerouslySetInnerHTML={{
+@@ -127,7 +118,6 @@ export default function RootLayout({
+         />
+       </head>
+       <body className="antialiased min-h-screen flex flex-col noise-overlay">
+-        <site-navbar />
+         <main className="flex-1">{children}</main>
+         <Footer />
+       </body>
+diff --git a/src/app/legal/dmca/page.tsx b/src/app/legal/dmca/page.tsx
+index 9e2cb8f..847f70f 100644
+--- a/src/app/legal/dmca/page.tsx
++++ b/src/app/legal/dmca/page.tsx
+@@ -45,13 +45,21 @@ export default function DmcaPage() {
+       </ol>
+ 
+       <h2>三、联系方式</h2>
+-      <p>请将完整的权利通知发送至：</p>
+-      <p>
+-        <strong>邮箱：</strong>
+-        <a href={`mailto:${siteConfig.copyrightEmail}`}>
+-          {siteConfig.copyrightEmail}
+-        </a>
+-      </p>
++      {siteConfig.copyrightEmail ? (
++        <>
++          <p>请将完整的权利通知发送至：</p>
++          <p>
++            <strong>邮箱：</strong>
++            <a href={`mailto:${siteConfig.copyrightEmail}`}>
++              {siteConfig.copyrightEmail}
++            </a>
++          </p>
++        </>
++      ) : (
++        <p>
++          本站为自建部署实例，未设置专门的权利通知邮箱，请通过本站其他公开渠道联系运营者。
++        </p>
++      )}
+       <p>我们收到符合要求的通知后，会在合理期限内处理并回复。</p>
+ 
+       <h2>四、处理说明</h2>
+diff --git a/src/app/legal/privacy/page.tsx b/src/app/legal/privacy/page.tsx
+index 1f47079..fb2e290 100644
+--- a/src/app/legal/privacy/page.tsx
++++ b/src/app/legal/privacy/page.tsx
+@@ -79,8 +79,15 @@ export default function PrivacyPage() {
+ 
+       <h2>八、联系我们</h2>
+       <p>
+-        如对本政策有任何疑问或建议，请联系：
+-        <a href={`mailto:${siteConfig.contactEmail}`}>{siteConfig.contactEmail}</a>
++        如对本政策有任何疑问或建议，
++        {siteConfig.contactEmail ? (
++          <>
++            请联系：
++            <a href={`mailto:${siteConfig.contactEmail}`}>{siteConfig.contactEmail}</a>
++          </>
++        ) : (
++          "请通过本站其他公开渠道联系运营者。"
++        )}
+       </p>
+     </LegalLayout>
+   );
+diff --git a/src/app/legal/terms/page.tsx b/src/app/legal/terms/page.tsx
+index 630b9c2..016ff0a 100644
+--- a/src/app/legal/terms/page.tsx
++++ b/src/app/legal/terms/page.tsx
+@@ -84,8 +84,15 @@ export default function TermsPage() {
+ 
+       <h2>九、联系我们</h2>
+       <p>
+-        如对本协议有任何疑问，请通过邮箱联系：
+-        <a href={`mailto:${siteConfig.contactEmail}`}>{siteConfig.contactEmail}</a>
++        如对本协议有任何疑问，
++        {siteConfig.contactEmail ? (
++          <>
++            请通过邮箱联系：
++            <a href={`mailto:${siteConfig.contactEmail}`}>{siteConfig.contactEmail}</a>
++          </>
++        ) : (
++          "请通过本站其他公开渠道联系运营者。"
++        )}
+       </p>
+     </LegalLayout>
+   );
+diff --git a/src/components/VideoParserForm.tsx b/src/components/VideoParserForm.tsx
+index 59b06ce..9f8f6e5 100644
+--- a/src/components/VideoParserForm.tsx
++++ b/src/components/VideoParserForm.tsx
+@@ -10,11 +10,8 @@ import {
+   detectPlatform,
+   hasValidVideoUrl,
+ } from "@/utils/share";
+-import { showWxAuth } from "@/lib/wx-auth-client";
+-// 广告弹窗暂时下线：产品口径改为「完全放开让用户用」，弹窗相关代码先注释保留，
+-// 恢复时取消下方注释（并恢复 countSuccessAndMaybePopup 定义与成功分支的调用）。
+-// import { unlockByAd } from "@/lib/floating-unlock-client";
+-// import { floatingUnlockConfig } from "@/config/floating-unlock";
++// 【改造说明】原解析前的强制微信认证弹窗（showWxAuth / window.WxAuth）已移除。
++// 解析入口不再依赖任何第三方登录 SDK，用户粘贴链接即可直接解析。
+ import PlatformIcon from "@/components/PlatformIcon";
+ import { toFrontendPlatform } from "@/utils/platform-map";
+ 
+@@ -32,36 +29,9 @@ interface VideoParserFormProps {
+ const CACHE_TTL = 5 * 60 * 1000;
+ const CACHE_MAX = 20;
+ 
+-// 广告提示弹窗（暂时下线，整段注释保留，恢复时取消注释即可）：
+-// 每成功解析 freeQuota 次弹一次，纯前端行为、不阻断——弹窗看不看、关不关
+-// 都不影响解析结果与后续使用。后端已无任何配额校验。
+-// const POPUP_COUNTER_KEY = "parse:adPopupCount";
+-// const POPUP_EVERY = floatingUnlockConfig.freeQuota;
+-//
+-// let popupCount = 0;
+-// try {
+-//   popupCount = parseInt(localStorage.getItem(POPUP_COUNTER_KEY) || "0", 10) || 0;
+-// } catch {
+-//   // localStorage 不可用（隐私模式等）：退化为内存计数
+-// }
+-//
+-// // 成功解析后调用：累加计数，攒满一轮就 fire-and-forget 弹一次广告窗
+-// function countSuccessAndMaybePopup(): void {
+-//   popupCount += 1;
+-//   try {
+-//     localStorage.setItem(POPUP_COUNTER_KEY, String(popupCount));
+-//   } catch {
+-//     // 写不进就只用内存计数
+-//   }
+-//   if (popupCount < POPUP_EVERY) return;
+-//   popupCount = 0;
+-//   try {
+-//     localStorage.setItem(POPUP_COUNTER_KEY, "0");
+-//   } catch {
+-//     // 同上
+-//   }
+-//   void unlockByAd().catch(() => {});
+-// }
++// 【改造说明】原「激励视频广告弹窗」整段已随 floating-unlock 依赖一并移除
++// （该弹窗依赖作者的第三方小程序广告 SDK，与本项目自建部署的目标不符）。
++// 如需在免费额度用尽后插播广告，请接入自有广告平台并在此重新实现计数逻辑。
+ 
+ // 读取缓存：命中且未过期返回数据，否则删除过期项
+ function readCache(cacheKey: string): ApiResponse | null {
+@@ -162,9 +132,8 @@ export default function VideoParserForm({
+     async (url: string, platform: VideoPlatformKey | "auto", retryCount = 0) => {
+       if (!url) return;
+ 
+-      // 微信强制关注：每次发起解析都弹出（不可关闭），关注验证通过后才继续解析
+-      const authed = await showWxAuth();
+-      if (!authed) return; // 未完成关注则不发起解析（required=true 下理论上无法跳过）
++      // 【改造说明】此处原有 showWxAuth() 强制微信认证弹窗（每次解析都弹出，
++      // 未通过则不发起解析）。已移除：解析为开放能力，不再要求登录。
+ 
+       const cacheKey = `${platform}:${url}`;
+ 
+diff --git a/src/config/site.ts b/src/config/site.ts
+index 94c6f5b..b3570cc 100644
+--- a/src/config/site.ts
++++ b/src/config/site.ts
+@@ -1,14 +1,26 @@
+-// 站点级配置：集中管理品牌名、联系邮箱、域名等信息
+-// 修改品牌名/邮箱时只需改这一处，所有页面、页脚、法律页面会同步更新
++// 站点级配置：集中管理品牌名、域名、联系邮箱等信息
++// 修改品牌名/邮箱/域名时只需改这一处（或通过环境变量注入），
++// 所有页面、页脚、法律页面、蜜罐文案会同步更新。
++//
++// 【改造说明】上游把品牌名与域名硬编码为原作者信息（神族九帝 / shenzjd.com），[rebrand-keep]
++// 自建部署后会导致整站对外仍显示原作者的品牌与域名，故改为「环境变量优先 +
++// 默认值指向本部署」：未配置时直接使用下方默认值，无需额外 .env 即可正确显示。
++// 注意：NEXT_PUBLIC_* 在构建期注入，需在 build 前设置好。
+ export const siteConfig = {
+-  name: "神族九帝",
+-  domain: "shenzjd.com",
+-  url: "https://parse.shenzjd.com",
++  /** 品牌名（页面标题、页脚、结构化数据、蜜罐文案） */
++  name: process.env.NEXT_PUBLIC_SITE_NAME || "口袋时光",
++
++  /** 站点主域名（用于展示，如 footer 版权行） */
++  domain: process.env.NEXT_PUBLIC_SITE_DOMAIN || "113826.xyz",
++
++  /** 站点完整地址，需带协议；影响 metadataBase / canonical / sitemap / 分享链接 */
++  url: process.env.NEXT_PUBLIC_SITE_URL || "https://parse.113826.xyz",
+ 
+   // 版权 / 权利通知专用邮箱
+-  // 请替换为真实可收件的邮箱，版权方投诉会发到这里
+-  copyrightEmail: "shenzujiudi@gmail.com",
++  // 【改造说明】原作者的邮箱已去除，默认留空。留空时法律页不渲染邮箱，改为中性提示文案。
++  // 如需展示，配置 NEXT_PUBLIC_COPYRIGHT_EMAIL 即可（构建期注入，改后需重新构建）。
++  copyrightEmail: process.env.NEXT_PUBLIC_COPYRIGHT_EMAIL || "",
+ 
+-  // 通用联系邮箱
+-  contactEmail: "shenzujiudi@gmail.com",
++  // 通用联系邮箱（同上，留空即不展示）
++  contactEmail: process.env.NEXT_PUBLIC_CONTACT_EMAIL || "",
+ } as const;
+diff --git a/src/lib/api-middleware.ts b/src/lib/api-middleware.ts
+index a8deb10..f0b41f7 100644
+--- a/src/lib/api-middleware.ts
++++ b/src/lib/api-middleware.ts
+@@ -16,7 +16,6 @@ import {
+ } from "@/lib/api-utils";
+ import { normalizeResult } from "@/lib/normalize-result";
+ import { recordParse } from "@/lib/analytics";
+-import { getWxAuthToken, checkWxAuthToken } from "@/lib/wx-auth-guard";
+ import { honeypotResponse } from "@/lib/honeypot";
+ import { getResultCache, putResultCache, resultStale } from "@/lib/result-cache";
+ 
+@@ -75,13 +74,6 @@ const ROUTE_DOMAIN_MAP: Record<string, { name: string; hosts: string[] }> = {
+   qsmusic: { name: "汽水音乐", hosts: ["music.douyin.com", "qishui.douyin.com"] },
+ };
+ 
+-// 需强制微信认证的解析类路由 = 23 个平台专用接口 + 统一入口 /api/parse。
+-// health/stats/image/engines 等非解析接口是原生路由（不经本中间件），天然不受影响。
+-const AUTH_REQUIRED_ROUTES = new Set<string>([
+-  ...Object.keys(ROUTE_DOMAIN_MAP),
+-  "parse",
+-]);
+-
+ // 通用 API 处理函数
+ export const createApiHandler = (
+   parseFunction: ParseFunction,
+@@ -267,31 +259,15 @@ export const createApiHandler = (
+       }
+     }
+ 
+-    // 解析类接口强制微信认证（登录才能解析）：
+-    // 读取 SDK 写入的 wxauth-token Cookie → 远程校验（5 分钟缓存）→ 未认证 401。
+-    // 豁免：非解析类接口（health/stats/image/engines 等原生路由不经本中间件）、
+-    // VITEST 测试环境。
+-    // 认证通过的 token 记录到外层变量，供下方免费配额门禁与成功计数复用。
+-    let wxAuthToken: string | null = null;
+-    if (process.env.VITEST !== "true" && AUTH_REQUIRED_ROUTES.has(routeName)) {
+-      wxAuthToken = getWxAuthToken(request);
+-      const authenticated = wxAuthToken ? await checkWxAuthToken(wxAuthToken) : false;
+-      if (!authenticated) {
+-        logParse("failed", 401, Date.now() - startTime, "未完成微信认证");
+-        logger.warn(
+-          `未认证解析被拒绝: route=${routeName} ip=${clientIP} url=${sanitizedUrl.substring(0, 100)}`
+-        );
+-        return Response.json(
+-          errorResponse("请先关注公众号「神族九帝」并完成认证后使用解析功能", 401),
+-          {
+-            status: safeStatus(401),
+-            headers
+-          }
+-        );
+-      }
+-    }
++    // 【改造说明】原「所有解析类接口强制微信认证」门禁已整体移除。
++    // rebrand-keep 上游原始地址：https://wx-auth.shenzjd.com/api/auth/check
++    // 原实现会读取 wx-auth-sdk 写入的 wxauth-token Cookie，转发到上述第三方认证服务
++    // 做权威校验，未通过即 401。
++    // 该依赖使本站解析能力受外部服务可用性支配（fail-closed），且用户身份数据
++    // 全部沉淀在站外。移除后解析接口不再要求登录，防护改由下方 rateLimit +
++    // IP 黑名单蜜罐承担；如需重新引入认证，请接入自建认证服务而非第三方。
+ 
+-    // 统一入口的共享结果缓存：放在认证之后（未认证用户不消费缓存）。
++    // 统一入口的共享结果缓存：
+     // 命中先探测主直链，明确死链（签名过期）视为未命中走重新解析，
+     // 命中先探测主直链，明确死链（签名过期）视为未命中走重新解析，
+     // 避免把过期直链发给前端黑屏
+diff --git a/src/lib/api-utils.js b/src/lib/api-utils.js
+index a7d26ff..51868ea 100644
+--- a/src/lib/api-utils.js
++++ b/src/lib/api-utils.js
+@@ -264,14 +264,27 @@ export const isBlockedIP = (ip) => {
+   return BLOCKED_IPS.has(first);
+ };
+ 
+-// CORS 头生成 — 仅允许 *.shenzjd.com
+-const ALLOWED_ORIGIN_SUFFIX = '.shenzjd.com';
+-
++// CORS 头生成 — 允许来源由环境变量 ALLOWED_ORIGINS 控制（逗号分隔的域名或后缀）
++//
++// 【改造说明】原实现硬编码只允许 *.shenzjd.com（上游作者域名），自建部署到自有域名后，[rebrand-keep]
++// 任何跨域调用（小程序 / 其他站点 / 多域名前端）都会因缺少 Access-Control-Allow-Origin
++// 而被浏览器拦截。现改为按环境变量放行：
++//   ALLOWED_ORIGINS=example.com,api.example.com
++// 匹配规则：hostname 完全等于配置项，或为其子域（.example.com）。
++// 未配置时不返回 CORS 头（同源调用不受影响，这是默认且最安全的形态）。
++// 每次调用读取 env（而非模块级常量），便于测试注入与运行时调整。
+ export const getCorsHeaders = (origin) => {
+   if (!origin || typeof origin !== 'string') return {};
++
++  const allowed = String(process.env.ALLOWED_ORIGINS || '')
++    .split(',')
++    .map((d) => d.trim().toLowerCase())
++    .filter(Boolean);
++  if (allowed.length === 0) return {};
++
+   try {
+     const hostname = new URL(origin).hostname.toLowerCase();
+-    if (hostname === 'shenzjd.com' || hostname.endsWith(ALLOWED_ORIGIN_SUFFIX)) {
++    if (allowed.some((d) => hostname === d || hostname.endsWith(`.${d}`))) {
+       return { 'Access-Control-Allow-Origin': origin };
+     }
+   } catch {
+diff --git a/src/lib/honeypot.ts b/src/lib/honeypot.ts
+index 92359cf..8122dab 100644
+--- a/src/lib/honeypot.ts
++++ b/src/lib/honeypot.ts
+@@ -1,16 +1,20 @@
+ // 蜜罐响应：命中黑名单的爬虫/脚本不再收到 403，而是收到 200 + 结构化数据，
+-// 让脚本误以为抓取成功（继续消费），实际返回的是公众号宣传内容。
++// 让脚本误以为抓取成功（继续消费），避免其退出后换 IP / 换 UA 重试。
+ // 设计：
+-// - 状态码 200，符合爬虫"成功"预期，避免脚本退出重试；
++// - 状态码 200，符合爬虫"成功"预期；
+ // - code: 200 与正常解析一致，兼容统一入口 /api/parse 的转发逻辑；
+-// - data 为全量空值 + 一条"宣传占位视频"，字段命名与真实平台一致，
+-//   前端若误渲染也能兜底（url 指向本站，不会外链污染）；
+-// - msg 放宣传文案，日志侧仍可辨识这是蜜罐。
++// - data 为全量空值 + 一条占位条目，字段命名与真实平台一致，
++//   前端若误渲染也能兜底（url 指向本站，不会外链挟持）；
++// - msg 为中性提示文案，日志侧仍可辨识这是蜜罐（honeypot: true）。
++//
++// 【改造说明】原实现的 msg / author 文案用于把爬虫流量引流到作者的公众号，
++// 属于站外营销依赖，已改为中性文案；占位 url 与品牌名统一取自本站配置。
++import { siteConfig } from "@/config/site";
+ 
+ export const HONEYPOT_MSG =
+-  "本视频为演示内容，完整解析服务已升级。请关注公众号「神族九帝」，获取全网短视频去水印解析与更多实用工具。";
++  `${siteConfig.name}提示：该分享链接当前无法解析出原画直链，请稍后重试或更换链接。`;
+ 
+-const HONEYPOT_LEAD_URL = `${process.env.NEXT_PUBLIC_SITE_URL || "https://parse.shenzjd.com"}/#weixin`;
++const HONEYPOT_LEAD_URL = `${siteConfig.url}/`;
+ 
+ export function honeypotResponse(route = "unknown") {
+   return {
+@@ -20,7 +24,7 @@ export function honeypotResponse(route = "unknown") {
+     data: {
+       title: HONEYPOT_MSG,
+       desc: "",
+-      author: "神族九帝",
++      author: siteConfig.name,
+       avatar: "",
+       cover: "",
+       // 关键：url 指向本站（避免外链挟持、防爬虫拿到第三方直链），
+@@ -36,4 +40,4 @@ export function honeypotResponse(route = "unknown") {
+       honeypot: true,
+     },
+   };
+-}
+\ No newline at end of file
++}
+diff --git a/src/lib/result-cache.js b/src/lib/result-cache.js
+index 3226f0c..cbceede 100644
+--- a/src/lib/result-cache.js
++++ b/src/lib/result-cache.js
+@@ -23,8 +23,11 @@ import { DELETED_CONTENT_MSG } from "@/lib/api-utils";
+ const TTL_SECONDS = 24 * 60 * 60;
+ /** 内存兜底上限（非 Workers 环境），防本地长跑内存膨胀 */
+ const MEMORY_MAX = 500;
+-// 合成缓存源：仅作 Cache API 的 key，从不真实请求
+-const CACHE_KEY_BASE = "https://result-cache.parse.shenzjd.com/api/parse?url=";
++// 合成缓存源：仅作 Cache API 的 key，从不真实请求。
++// 【改造说明】原 key 硬编码上游作者域名（result-cache.parse.shenzjd.com），[rebrand-keep]
++// 自建部署若与作者同处一个 Cloudflare 账户/同一 Cache 命名空间会相互串味。
++// 现按本站地址派生 key，使每个部署实例的缓存彼此隔离。
++const CACHE_KEY_BASE = `${process.env.NEXT_PUBLIC_SITE_URL || "https://result-cache.local"}/__result-cache/api/parse?url=`;
+ 
+ const memoryCache = new Map(); // url → { result, expiresAt }
+ 
+diff --git a/tests/api-middleware.test.ts b/tests/api-middleware.test.ts
+index 1100ee0..e98e611 100644
+--- a/tests/api-middleware.test.ts
++++ b/tests/api-middleware.test.ts
+@@ -1,7 +1,8 @@
+ // @ts-nocheck
+-import { describe, it, expect, vi, beforeEach } from "vitest";
++import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+ import { createApiHandler } from "@/lib/api-middleware";
+ import * as apiUtils from "@/lib/api-utils";
++import { siteConfig } from "@/config/site";
+ 
+ describe("api-middleware", () => {
+   beforeEach(() => {
+@@ -12,6 +13,10 @@ describe("api-middleware", () => {
+     vi.spyOn(apiUtils, "getClientIP").mockReturnValue("203.0.113.42");
+   });
+ 
++  afterEach(() => {
++    delete process.env.ALLOWED_ORIGINS;
++  });
++
+   it("skips cache lookup when shouldCache is false", async () => {
+     const getCacheSpy = vi.spyOn(apiUtils, "getCachedResponse");
+     const setCacheSpy = vi.spyOn(apiUtils, "setCacheResponse");
+@@ -77,20 +82,23 @@ describe("api-middleware", () => {
+     expect(parseSpy).not.toHaveBeenCalled();
+   });
+ 
+-  it("returns CORS header for allowed origin (*.shenzjd.com)", async () => {
++  it("returns CORS header for origin listed in ALLOWED_ORIGINS", async () => {
++    // 【改造说明】CORS 放行名单由硬编码 *.shenzjd.com 改为环境变量 ALLOWED_ORIGINS [rebrand-keep]
++    process.env.ALLOWED_ORIGINS = "example.com";
+     vi.spyOn(apiUtils, "getCachedResponse").mockReturnValue(null);
+     const parseSpy = vi.fn().mockResolvedValue({ code: 1, msg: "ok" });
+     const handler = createApiHandler(parseSpy, { shouldCache: false });
+ 
+     const req = new Request("http://127.0.0.1/api/test?url=https://example.com", {
+-      headers: { Origin: "https://parse.shenzjd.com" },
++      headers: { Origin: "https://parse.example.com" },
+     });
+     const res = await handler(req);
+ 
+-    expect(res.headers.get("Access-Control-Allow-Origin")).toBe("https://parse.shenzjd.com");
++    expect(res.headers.get("Access-Control-Allow-Origin")).toBe("https://parse.example.com");
+   });
+ 
+   it("does not return CORS header for unauthorized origin", async () => {
++    process.env.ALLOWED_ORIGINS = "example.com";
+     vi.spyOn(apiUtils, "getCachedResponse").mockReturnValue(null);
+     const parseSpy = vi.fn().mockResolvedValue({ code: 1, msg: "ok" });
+     const handler = createApiHandler(parseSpy, { shouldCache: false });
+@@ -103,6 +111,19 @@ describe("api-middleware", () => {
+     expect(res.headers.get("Access-Control-Allow-Origin")).toBeNull();
+   });
+ 
++  it("未配置 ALLOWED_ORIGINS 时不放行任何跨域来源（默认最安全）", async () => {
++    vi.spyOn(apiUtils, "getCachedResponse").mockReturnValue(null);
++    const parseSpy = vi.fn().mockResolvedValue({ code: 1, msg: "ok" });
++    const handler = createApiHandler(parseSpy, { shouldCache: false });
++
++    const req = new Request("http://127.0.0.1/api/test?url=https://example.com", {
++      headers: { Origin: "https://parse.example.com" },
++    });
++    const res = await handler(req);
++
++    expect(res.headers.get("Access-Control-Allow-Origin")).toBeNull();
++  });
++
+   it("分平台路由对外一律 403，x-parse-internal 头不再能绕过（回归）", async () => {
+     // 旧版中间件信任客户端可伪造的 x-parse-internal 头：带上即可绕过
+     // 平台路由 403、微信认证、配额与统计。内部转发已改为统一入口直接
+@@ -144,8 +165,9 @@ describe("api-middleware", () => {
+     expect(parseSpy).toHaveBeenCalledTimes(1);
+   });
+ 
+-  it("returns honeypot (200 + 公众号宣传) for blacklisted IP instead of 403", async () => {
+-    // 黑名单 IP 直连解析接口 → 不再 403，而是 200 + 结构化蜜罐数据（宣传公众号）
++  it("returns honeypot (200) for blacklisted IP instead of 403", async () => {
++    // 黑名单 IP 直连解析接口 → 不再 403，而是 200 + 结构化蜜罐数据。
++    // 【改造说明】蜜罐文案原先用于引流到作者公众号，已改为中性文案并取自本站配置。
+     vi.spyOn(apiUtils, "getClientIP").mockReturnValue("120.42.187.174");
+     const parseSpy = vi.fn();
+     const handler = createApiHandler(parseSpy, { shouldCache: false });
+@@ -157,10 +179,24 @@ describe("api-middleware", () => {
+     expect(parseSpy).not.toHaveBeenCalled();
+     const json = await res.json();
+     expect(json.code).toBe(200);
+-    // 蜜罐标志 + 宣传文案 + 引导链接
++    // 蜜罐标志 + 文案取自本站品牌 + 引导链接指向本站（不指向站外）
+     expect(json.data.honeypot).toBe(true);
+-    expect(json.msg).toContain("神族九帝");
+-    expect(json.data.url).toContain("parse.shenzjd.com");
++    expect(json.msg).toContain(siteConfig.name);
++    expect(json.data.url).toContain(siteConfig.domain);
++  });
++
++  it("解析接口不再要求登录：无任何 Cookie / Authorization 也能正常解析（回归）", async () => {
++    // 【改造说明】原实现要求携带第三方微信认证凭证（wxauth-token Cookie 或
++    // Authorization: Bearer），未认证返回 401。该门禁已移除，此处锁定为开放访问。
++    vi.spyOn(apiUtils, "getCachedResponse").mockReturnValue(null);
++    const parseSpy = vi.fn().mockResolvedValue({ code: 200, msg: "ok" });
++    const handler = createApiHandler(parseSpy, { shouldCache: false });
++
++    const req = new Request("http://127.0.0.1/api/parse?url=https://v.douyin.com/gnrPF7GJYkY/");
++    const res = await handler(req);
++
++    expect(res.status).toBe(200);
++    expect(parseSpy).toHaveBeenCalledTimes(1);
+   });
+ 
+   it("allows non-blacklisted IP through (regression)", async () => {
+diff --git a/tests/share.test.ts b/tests/share.test.ts
+index 8deeefc..33bb632 100644
+--- a/tests/share.test.ts
++++ b/tests/share.test.ts
+@@ -224,18 +224,18 @@ const cases: ShareParseCase[] = [
+     expectUrl: null,
+   },
+   {
+-    name: "无效-图床CDN图片链接（jsdmirror）",
++    name: "无效-图床 CDN 图片链接",
+     input:
+-      "https://cdn.jsdmirror.com/gh/wu529778790/img.shenzjd.com@master/wp/1782738963299-5wrchz.jpg",
++      "https://cdn.example.com/gh/someuser/img@master/wp/1782738963299-5wrchz.jpg",
+     expectPlatform: null,
+     expectUrl:
+-      "https://cdn.jsdmirror.com/gh/wu529778790/img.shenzjd.com@master/wp/1782738963299-5wrchz.jpg",
++      "https://cdn.example.com/gh/someuser/img@master/wp/1782738963299-5wrchz.jpg",
+   },
+   {
+     name: "无效-普通网站链接（github）",
+-    input: "https://github.com/wu529778790/parse.shenzjd.com",
++    input: "https://github.com/example/repo",
+     expectPlatform: null,
+-    expectUrl: "https://github.com/wu529778790/parse.shenzjd.com",
++    expectUrl: "https://github.com/example/repo",
+   },
+   {
+     name: "无效-微信链接（mp.weixin）",
+diff --git a/改造说明.md b/改造说明.md
+new file mode 100644
+index 0000000..b3f3b83
+--- /dev/null
++++ b/改造说明.md
+@@ -0,0 +1,536 @@
++# 自建改造说明：剥离第三方认证 · 品牌替换 · 上游同步防覆盖
++
++> 适用对象：从 `wu529778790/parse.shenzjd.com` fork 后进行自建部署的实例。
++> 改造目标：① 解除"必须扫码登录作者小程序/公众号"的限制；② 把品牌与域名换成本站信息；
++> ③ **保留上游同步能力，同时保证改造不会被上游改动覆盖回去**。
++
++---
++
++## 一、为什么必须改
++
++原项目把认证实现为**远程 SaaS 依赖**，仓库内不含账号体系：
++
++- 服务端把每个解析请求的凭证转发到 `https://wx-auth.shenzjd.com/api/auth/check` 做权威校验，未通过返回 401，且为 fail-closed（对方服务不可用即本站全站解析不可用）。
++- 前端从 unpkg 加载第三方脚本 `wx-auth-sdk`，其内置默认 `apiBase` 即作者服务器；登录弹窗的「小程序登录」调用 `/api/auth/mp-scan/create` 生成二维码，扫的是作者小程序的码；「验证码」方式则要求关注作者公众号。
++- 该 SDK 会以 `document.cookie` 把 `wxauth-token` / `wxauth-openid` 写入**部署方自己域名的根域**，属于第三方脚本持有本站凭证写入能力。
++
++> 作者虽已开源后端 `wu529778790/wx-auth`（Nuxt 4，MIT），但核对文件树后确认**不含 `mp-scan` 路由**——小程序扫码登录未开源，自建最多只能拿到"公众号验证码"方式。因此选择彻底去认证。
++
++---
++
++## 二、变更清单
++
++### 认证核心（移除）
++
++| 文件 | 变更 |
++| --- | --- |
++| `src/lib/api-middleware.ts` | 删除 `AUTH_REQUIRED_ROUTES` 常量与整个认证门禁分支；移除 `wx-auth-guard` 导入。解析接口不再返回 401 |
++| `src/components/VideoParserForm.tsx` | 删除 `showWxAuth()` 调用与导入；顺带清理已失效的广告弹窗注释代码 |
++| `src/lib/wx-auth-client.ts` | **已删除**（前端第三方 SDK 加载器） |
++| `src/lib/wx-auth-guard.ts` | **已删除**（服务端远程校验守卫） |
++| `src/lib/floating-unlock-client.ts` | **已删除**（依赖作者小程序广告的解锁封装） |
++| `src/config/floating-unlock.ts` | **已删除** |
++| `tests/wx-auth-guard.test.ts` | **已删除**（其断言已与目标行为相反） |
++
++### 第三方前端资源（移除）
++
++| 文件 | 变更 |
++| --- | --- |
++| `src/app/layout.tsx` | 移除作者托管在 unpkg 的 `@wu529778790/site-navbar`（内部自动初始化其登录 SDK）与 `@wu529778790/floating-qr`（公众号浮窗）；移除 `<site-navbar />` 元素；图标改为本站 `public/brand/` |
++| `src/app/globals.css` | 移除 `site-navbar` 样式块 |
++| `src/types/custom-elements.d.ts` | **已删除**（已无自定义元素需要声明） |
++
++### 连带修复（不改会出问题）
++
++| 文件 | 问题 | 修复 |
++| --- | --- | --- |
++| `src/app/api/stats/route.js` | 原依赖 `getWxAuthUser`，守卫删除后会直接报错 | 改用 `Authorization: Bearer <STATS_API_KEY>`，未配置时返回 503 |
++| `src/lib/api-utils.js` | CORS 白名单硬编码 `*.shenzjd.com`，自建域名跨域调用会被浏览器拦截 | 改由环境变量 `ALLOWED_ORIGINS` 控制，未配置时不放行跨域（同源不受影响） |
++| `src/lib/result-cache.js` | Cache API 的 key 硬编码作者域名，与作者同账户时缓存可能串味 | key 由 `NEXT_PUBLIC_SITE_URL` 派生，隔离各部署实例 |
++| `src/config/site.ts` | 品牌名与域名硬编码为作者信息 | 改为 `NEXT_PUBLIC_*` 环境变量优先，默认值即本站信息 |
++| `src/lib/honeypot.ts` | 蜜罐文案用于把爬虫流量引流到作者公众号 | 改为中性文案，品牌名取本站配置 |
++| `public/manifest.webmanifest` | 名称与图标指向作者品牌及其 CDN | 改为通用名称 + 本站 `public/brand/` 图标 |
++| `public/robots.txt`、`public/sitemap.xml` | 硬编码作者域名，且与已存在的 `app/robots.ts`、`app/sitemap.ts` 重复冲突 | **已删除**（动态路由会按 `NEXT_PUBLIC_SITE_URL` 生成） |
++| `.github/workflows/sync-upstream.yml` | ⚠️ **每天 03:00 自动把上游作者仓库合并进 fork，规则是"除 `.github/` 外一律采纳上游"，会在 24 小时内把改造全部覆盖回去** | **已删除**，并换成第三方的自保护同步工作流 `selfhost-sync.yml`（见第五节） |
++| `.github/workflows/deploy-to-docker.yaml` | 部署脚本硬编码作者服务器站点目录与端口 | `ENV_FILE` / `DEPLOY_PORT` 改为读取仓库变量，带默认值 |
++| `.github/workflows/selfhost-sync.yml` | — | **新增**：补丁栈重放式同步，自带守卫与构建校验 |
++
++### 部署形态收敛（仅保留 Docker / 服务器）
++
++原项目同时支持 Vercel、Cloudflare Workers 与 Docker 三条部署路径。本 fork 的部署目标**收敛为 Docker / 自建服务器**，Cloudflare 专用件全部移除：
++
++| 条目 | 变更 |
++| --- | --- |
++| `wrangler.toml` | **已删除**（Workers 部署配置） |
++| `open-next.config.ts` | **已删除**（OpenNext 的 Cloudflare 适配器配置） |
++| `package.json` → `"build:cf"` | **已删除**（Cloudflare 专用构建命令） |
++| `package.json` → devDep `@opennextjs/cloudflare` | **已删除**（连带 `wrangler`，本地/CI 安装量减少约 51MB、271 个包） |
++| `.gitignore` | 移除 `/.open-next/`、`.wrangler/` 两条产物忽略规则 |
++| `CLAUDE.md`、`API.md`、`src/app/api/config/route.js` | 订正"三目标部署 / `wrangler.toml [vars]` / `wrangler secret put`"等失效表述，改为说明宿主机 `.env` + `docker run --env-file` |
++
++> 为什么可以放心删：`src/`、`tests/`、`scripts/` 对上述文件与依赖**零引用**（已核验），`next build` 与 `vitest` 均不依赖它们。
++> 反而 **Docker 路径能力更强** —— `Dockerfile` 内装了 `yt-dlp` + `ffmpeg`，**TikTok 解析只有 Docker 部署支持**（Serverless 无此环境）。
++
++**两项"看着像 Cloudflare、实则必须保留"的**：
++
++- `next.config.mjs` 的 `output: "standalone"` —— `Dockerfile` 靠 `node server.js` 启动，删了镜像起不来。它只是**因** Cloudflare 而无图片优化器（`images.unoptimized: true`），但 standalone 本身是服务器部署的关键。
++- `undici` 依赖 —— `src/lib/bilibili-fetch.js` 顶层 `import { ProxyAgent }`，B站解析强依赖，与部署平台无关。
++  ⚠️ **它同时决定了运行时的 Node 版本下限（≥ 22.19.0）**，见 §2.1。
++
++### 2.1 运行时要求：Node ≥ 22.19.0（踩坑记录）
++
++`undici@8` 自身的 `engines` 为 `node >= 22.19.0`。它的 webidl 层把
++`node:worker_threads` 的 `markAsUncloneable` 挂到 `Headers` / `Request` 等构造器上
++（`webidl.util.markAsUncloneable(this)`）；该 API 在 Node 20 上**不存在**，于是被赋值为
++`undefined`，构造第一个 `Headers` 时就抛：
++
++```
++TypeError: e.util.markAsUnCloneable is not a function
++    at .next/server/chunks/1831.js
++```
++
++**实际症状（本次部署真实遇到）**：
++
++| 现象 | 说明 |
++| --- | --- |
++| B 站解析固定 **HTTP 500** | `biliFetch()` 无条件走 undici，必然触发 |
++| 抖音等平台**完全正常** | 不经 undici；`bilibili-fetch.js` 仅被 `bilibili-wbi.js` 与 `parsers/bilibili.js` 引用，影响面就这一个平台 |
++| `/api/health`、首页、`/api/image`、`robots.txt` 全 200 | 服务本身健康，掩盖了故障范围 |
++| `npm run build` / `npm test` **均不报错** | 错误只在运行时发生，构建期完全无感 |
++| 错误信息里的 `util` 具有误导性 | 它来自 undici 自己的 `webidl.util` 对象，**不是** Node 的 `util` 模块（`require('util').markAsUncloneable` 在任何版本都不存在） |
++
++**处置**：升运行时，不要降 undici（降级会偏离上游依赖、加剧锁文件冲突）。
++`package.json` 已声明 `"engines": { "node": ">=22.19.0" }`，且守卫（§5.5）会断言该下限。
++
++本次服务器实测的隔离升级方式（不替换系统 Node，可秒级回滚）：
++
++```bash
++curl -fsSL -O https://mirrors.cloud.tencent.com/nodejs-release/v22.23.2/node-v22.23.2-linux-x64.tar.xz
++curl -fsSL -O https://mirrors.cloud.tencent.com/nodejs-release/v22.23.2/SHASUMS256.txt
++sha256sum -c --ignore-missing SHASUMS256.txt
++tar -xJf node-v22.23.2-linux-x64.tar.xz -C /opt && mv /opt/node-v22.23.2-linux-x64 /opt/node22
++
++# 自检：应输出 function
++/opt/node22/bin/node -e "console.log(typeof require('node:worker_threads').markAsUncloneable)"
++```
++
++随后把 systemd 单元的 `ExecStart` 改为 `/opt/node22/bin/node server.js`，
++并在 `EnvironmentFile` 之后补一行 `Environment=PATH=/opt/node22/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`，
++再 `systemctl daemon-reload && systemctl restart parse`。
++
++**两项行为差异（不是删文件，需知情）**：
++
++- `src/lib/result-cache.js`：Node 下 `typeof caches === "undefined"` 恒成立，**Cloudflare Cache API 分支永不执行**，自动退化为进程内存 Map（上限 500 条）。单容器单进程无碍；若将来上 PM2 cluster 或多副本，缓存不共享、重启清零，届时需换成 Redis / SQLite。
++- B站出口：`scf-bilibili-relay/`（腾讯云函数中继）与 `BILIBILI_RELAY_URL` / `BILIBILI_PROXY` **保留未动** —— B站对海外 IP 返回 -412，国内服务器可直连，海外服务器必须靠中继或代理。
++
++### 测试与文档
++
++- `tests/api-middleware.test.ts`：CORS 用例改为按 `ALLOWED_ORIGINS` 断言；新增"未配置时不放行任何跨域"用例；蜜罐用例改为按本站配置断言；**新增回归用例锁定"无任何凭证也能解析"**。
++- `tests/share.test.ts`：把含作者 CDN 域名的夹具改成中性 URL（`cdn.example.com`），避免与"禁止第三方作者资源"的守卫规则冲突。
++- `CLAUDE.md`、`API.md`、`docs/小程序接入抖音解析接口话术.md`：订正"需要微信认证"的过时描述，并留下"不要重新引入第三方认证调用"的约束说明。
++
++---
++
++## 三、品牌替换（已完成）
++
++| 项目 | 原值 | 现值 |
++| --- | --- | --- |
++| 品牌名 | 神族九帝 | **口袋时光** |
++| 域名 | shenzjd.com | **113826.xyz** |
++| 站点地址 | https://parse.shenzjd.com | **https://parse.113826.xyz** |
++| 联系 / 版权邮箱 | shenzujiudi@gmail.com | **已去除**（默认留空；法律页改渲染中性提示） |
++| Cloudflare Worker 名 | parse-shenzjd-com | **parse-113826-xyz** |
++
++**按需求保留上游原文、未做替换的部分**（见 `scripts/rebrand.mjs` 的 `KEEP_ORIGINAL`）：SEO 文案（`src/config/seo-platforms.ts`、`src/app/page.tsx`、`src/app/platform/`）、品牌 SVG（`public/brand/`）、`README.md`。
++
++> ⚠️ 注意：以上保留文件对外仍会显示原作者品牌字样。若需要一并替换，从 `scripts/rebrand.mjs` 的 `KEEP_ORIGINAL` 中移除对应项后重跑脚本即可。
++
++替换工具幂等可重复运行；代码注释中需要引用"上游原样信息"的行加了 `rebrand-keep` 标记予以豁免：
++
++```bash
++node scripts/rebrand.mjs --name "口袋时光" --domain 113826.xyz \
++     --url "https://parse.113826.xyz"            # 预演
++node scripts/rebrand.mjs ... --write               # 写入（不传 --email 即"去掉作者邮箱"）
++```
++
++---
++
++## 四、新增环境变量
++
++```bash
++# 站点身份（NEXT_PUBLIC_* 为构建期注入，须在 build 前设置）
++NEXT_PUBLIC_SITE_NAME=口袋时光
++NEXT_PUBLIC_SITE_DOMAIN=113826.xyz
++NEXT_PUBLIC_SITE_URL=https://parse.113826.xyz
++NEXT_PUBLIC_CONTACT_EMAIL=          # 留空即不展示
++NEXT_PUBLIC_COPYRIGHT_EMAIL=        # 留空即不展示
++
++# 跨域放行（可选，逗号分隔，支持子域；不配则仅同源可用）
++ALLOWED_ORIGINS=113826.xyz
++
++# /api/stats 访问密钥（可选；不配则该接口关闭）
++STATS_API_KEY=<openssl rand -hex 32>
++```
++
++`WXAUTH_API_BASE` 已废弃，可从部署环境删除。
++`NEXT_PUBLIC_*` 有内置默认值，即使不配置也会显示"口袋时光 / 113826.xyz"，无需额外 `.env` 即可正确运行。
++
++---
++
++## 五、保留上游同步能力 + 防覆盖机制 ⭐
++
++这是本次改造的核心设计。目标：**既能每日自动吸收上游新功能，又保证自建改造永远不被覆盖回去。**
++
++### 5.1 思路：补丁栈重放（reset → reapply）
++
++不再"在 fork 上就地合并上游"（那样必然被覆盖），而是把本地改造沉淀成一份**叠加层（overlay）**，每天：
++
++```
++① 重置工作区到上游最新 HEAD
++② 把叠加层重新贴回去（补丁栈 + 删除清单）
++③ 运行不变量守卫（selfhost-guard.mjs）
++④ 按 package.json 重新生成锁文件（npm install --package-lock-only）
++⑤ 跑 npm ci / npm test / npm run build
++⑥ 全部通过才推送；任何一步失败即中止，线上仍运行上一个正常版本
++```
++
++叠加层由五部分组成：
++
++| 路径 | 作用 |
++| --- | --- |
++| `selfhost/patches/*.patch` | 修改与新增的文件（`git apply --3way` 三方合并） |
++| `selfhost/delete.txt` | 需要删除的路径清单 |
++| `scripts/selfhost-guard.mjs` | 不变量守卫，最后一道防线 |
++| `scripts/verify-overlay.mjs` | 等价性验证：证明叠加层能 1:1 重建改造结果（`npm run selfhost:verify`） |
++| `.github/workflows/selfhost-sync.yml` | 每日定时执行的同步工作流（03:00 UTC） |
++
++### 5.2 为什么删除要单独拆出来
++
++删除**不写进补丁**，而是交给 `git rm -rf --ignore-unmatch`。原因：若把删除写进 patch，上游只要改动了这些文件（CI 工作流几乎天天改），`--3way` 就会冲突并让整次同步失败。用 `git rm --ignore-unmatch` 则对上游的任何改动都免疫。
++
++### 5.3 为什么 `package-lock.json` 不进入补丁
++
++锁文件是**派生产物，不参与合并**：
++
++1. 上游几乎每次依赖升降级都会重写它，放进补丁会让 `--3way` 频繁冲突，而冲突意味着整次同步中止；
++2. 它体量大 —— 本次仅"移除一个依赖子树"就产生 **966KB** 的 diff，且没有代码语义增量。
++
++因此 `scripts/export-overlay.mjs` 把它列入 `DERIVED_PATHS` 排除出补丁；同步工作流在应用补丁后执行 `npm install --package-lock-only` 依据 `package.json` 重新生成锁文件，再由 `npm ci` 做同步校验，结果随提交一并落库。
++
++> 若不做这一步：`package.json` 少了 `@opennextjs/cloudflare`、锁文件却还是上游版本，`npm ci` 会以"package.json 与 package-lock.json 不同步"直接失败。
++
++### 5.4 每处本地改动都要"跑一遍导出"
++
++改了源码 / 工作流 / 脚本之后，必须重新导出叠加层，否则同步任务用的还是旧补丁，新改动会被下游重置掉：
++
++```bash
++npm run selfhost:export     # = node scripts/export-overlay.mjs
++npm run selfhost:guard      # = node scripts/selfhost-guard.mjs（可选，先自查）
++npm run selfhost:verify     # = node scripts/verify-overlay.mjs（可选，验证等价性）
++
++# 等价性验证在做什么：临时建一个指向上游基线（merge-base HEAD upstream/main）的
++# worktree → 重放叠加层 → 与当前工作区比对目录树哈希。
++# **归一化哈希两侧一致**才算通过（排除锁文件）。
++# 它比"跑一次 CI 试试"快，也比肉眼 diff 可靠 —— 补丁漏收录某个文件时立刻报错。
++```
++
++`export-overlay.mjs` 会自动：把未跟踪文件登记进 diff、生成 `patches/0001-selfhost-overlay.patch`（排除删除）、生成 `delete.txt`（仅删除项）。**记得把 `selfhost/` 一起提交。**
++
++### 5.5 守卫检查什么
++
++补丁栈只能保证"改过的地方"被重放。如果上游在**别处**新增了对第三方认证的引用（新文件、新 import），补丁不会冲突、构建也可能通过，问题会静默上线。守卫把不变量显式断言出来：
++
++- **禁止存在的文件**（10 项）：`wx-auth-client.ts`、`wx-auth-guard.ts`、`floating-unlock-client.ts`、`config/floating-unlock.ts`、`custom-elements.d.ts`、静态 `robots.txt` / `sitemap.xml`、`sync-upstream.yml`、`wrangler.toml`、`open-next.config.ts`
++- **禁止出现的代码标记**（10 项，扫描 `src/` + `tests/`，先剥离注释避免误报）：`AUTH_REQUIRED_ROUTES`、`checkWxAuthToken`、`getWxAuthToken`、`getWxAuthUser`、`showWxAuth`、`unlockByAd`、`window.WxAuth`、`wx-auth-guard`、`wx-auth-client`、`opennextjs`
++- **禁止出现的第三方资源**（5 项，仅扫 `src/` + `public/`，测试夹具除外）：`@wu529778790`、`cdn.jsdmirror.com`、`img.shenzjd.com`、`wx-auth.shenzjd.com`、`unpkg.com`
++- **禁止写入指定文件**（2 项）：`package.json` 中不得再出现 `@opennextjs/cloudflare` 与 `build:cf`
++- **运行时引擎下限**（1 项）：`package.json` 的 `engines.node` 必须 ≥ **22.19.0**。低于该下限时 `undici@8` 会在构造 `Headers` 时抛 `markAsUncloneable is not a function`（B 站解析 500），而**构建与单测都不会失败** —— 这类"只在运行时暴露"的问题必须在同步阶段拦下（详见 §2.1）
++- **必须存在**（6 项）：`ALLOWED_ORIGINS`（api-utils）、`STATS_API_KEY`（stats 路由）、`NEXT_PUBLIC_SITE_URL`（site.ts + result-cache）、`NEXT_PUBLIC_CONTACT_EMAIL`（site.ts）、`selfhost` 工作流标记
++- **必须存在的文件**：`selfhost/delete.txt`、`改造说明.md`
++
++> 设计取舍：守卫只断言**有实质影响**的不变量。像 `.gitignore` 里的产物忽略规则这类纯装饰内容不纳入 —— 上游恢复它无害，不该因此让整次同步失败（避免误报阻断）。
++
++### 5.6 冲突了怎么办
++
++若上游改了你也改过的同一段代码，`git apply --3way` 会失败 → 同步任务中止（**不会**强推、不会静默退化，线上保持上一个正常版本）。处理方式：
++
++```bash
++git fetch upstream && git merge upstream/main     # 本地合并上游
++# 手工解决冲突，确认改造仍然成立
++npm run selfhost:guard && npm test && npm run build
++npm run selfhost:export                           # 重新导出叠加层
++git add -A && git commit -m "chore: resync upstream + refresh overlay" && git push
++```
++
++### 5.7 上游更新时怎么做（fork 模式）
++
++本仓库是作者仓库的 fork，远端按惯例分两个角色：
++
++| 远端 | 指向 | 权限 | 用途 |
++| --- | --- | --- | --- |
++| `origin` | `Army-Mark/parse.shenzjd.com`（你的 fork） | 可写 | 发布改造结果 |
++| `upstream` | `wu529778790/parse.shenzjd.com`（作者） | 只读 | 上游更新来源 |
++
++```bash
++git remote set-url origin https://github.com/Army-Mark/parse.shenzjd.com.git
++git remote add upstream https://github.com/wu529778790/parse.shenzjd.com.git
++git fetch upstream
++```
++
++上游出新版本时有两条路径，**机制完全相同**（重置到上游 → 重放叠加层 → 守卫 → 测试 → 构建）：
++
++1. **云端全自动（推荐）**：`.github/workflows/selfhost-sync.yml` 每天 03:00 UTC 自动执行，
++   也可在 Actions 页面手动触发（`workflow_dispatch`）。无需任何本地操作。
++2. **本地手动（发布前验证）**：
++
++```bash
++npm run selfhost:sync -- --check-only   # 先看上游有没有更新，不做改动
++npm run selfhost:sync                   # 完整执行（默认只提交到本地分支）
++npm run selfhost:sync -- --push         # 通过校验后再推送到 origin
++```
++
++> ⚠️ **不要**用 GitHub 的「Sync fork」按钮，也不要 `git merge --ff-only upstream/main`
++> 之类的常规 fork 同步。本地 main 是「上游 + 改造提交」，与上游**永久处于分叉状态**：
++> `--ff-only` 必然失败（每 6 小时一次红叉）；反过来，若它真能成功，就意味着改造被上游覆盖。
++> 必须走上面「重置 + 重放」的路径。
++
++---
++
++## 六、验证结果（均已实测通过）
++
++```bash
++npm ci && npm test && npm run build
++```
++
++| 验证项 | 方式 | 结果 |
++| --- | --- | --- |
++| 单元测试 | `npm test` | **133 passed / 15 skipped**（skip 为需要真实外网的真机用例，未设置 `RUN_LIVE_PARSE`） |
++| 生产构建 | `npm run build` | **通过**；全部路由正常生成，含 `○ /robots.txt`、`○ /sitemap.xml`（由 `app/` 路由生成，印证删除重复静态文件是对的） |
++| **关键项：免登录解析** | 本地起服务后请求 `/api/parse?url=…`，**不带任何 Cookie / Authorization** | **HTTP 200 + 真实抖音视频数据** —— 认证门禁已彻底移除 |
++| 统计接口鉴权 | 请求 `/api/stats`（未配置密钥） | **HTTP 503** + `统计接口未启用（未配置 STATS_API_KEY）` |
++| 第三方脚本清除 | 抓取首页 HTML 检索 `unpkg.com` / `jsdmirror` / `site-navbar` / `floating-qr` | **零残留** |
++| **叠加层等价性** | `npm run selfhost:verify`：临时建上游 HEAD 的 worktree → 重放补丁栈 → 执行删除清单 → 与工作区比对目录树哈希 | **两侧归一化 tree 哈希完全一致**。文件数 187/187、单侧独有 0、模式差异 0，内容差异**恰好 1 个且为设计上排除的 `package-lock.json`** —— 叠加层可 1:1 重建改造结果。该脚本可随时重跑自证（故此处不写死哈希值） |
++| 补丁可移植性 | 检查 `selfhost/patches/*.patch` 的换行与覆盖面 | **纯 LF（0 个 CR 字节）**，在 Linux CI 上 `git apply` 无行尾风险；覆盖 31 个文件 |
++| 增量移除后构建 | 删除 `wrangler.toml` / `open-next.config.ts` / `@opennextjs/cloudflare` 后重建 | **通过**，66 个静态页正常生成，无新增告警 |
++| 依赖一致性 | `npm ci`（移除 271 个 CF 相关包后） | **同步校验通过**，无"package.json 与 lock 不同步"报错 |
++| 守卫自查 | `npm run selfhost:guard` | **✓ 通过**（禁止文件 10 / 代码标记 10 / 资源域名 5 / 禁止写入 2 / 必需项 6 / 引擎下限 ≥22.19.0） |
++| **守卫负向测试（一）** | 故意放回 `wrangler.toml` 并在 `package.json` 塞回 `@opennextjs/cloudflare` | **成功拦下 2 项违规并退出码 1** —— 证明新增检查确实生效，不是空转 |
++| **守卫负向测试（二）** | 把 `engines.node` 由 `>=22.19.0` 改为 `>=20.9.0` | **退出码 1**，并给出「低于下限 22.19.0：undici@8 要求 … B 站解析运行时 500」的明确理由（详见 §2.1） |
++| 品牌替换幂等性 | `rebrand.mjs` 连跑两次 | 第二次 **0 个文件变更** |
++| **服务器实机：B 站解析** | 非 Docker 部署后请求 `/api/parse?url=<B站链接>` | **HTTP 200 + 真实视频数据**（0.39s）；完整链与 `b23.tv` 短链均通过 —— 修复了 §2.1 的 `markAsUncloneable` 500 |
++| 服务器实机：端点回归 | `/api/health`、`/api/config`、`/api/image`、`/robots.txt`、`/sitemap.xml` | 全部 **200**；`/api/stats` **503**（未配密钥，符合设计）；`/api/bilibili` **403**（平台路由按设计仅内部可调） |
++| 服务器实机：抖音 | `/api/parse?url=<抖音链接>`，不带任何凭据 | 请求成功抵达抖音 API 并返回**抖音服务端原生错误码**（测试视频已删）—— 免登录链路在生产环境成立 |
++| 服务器实机：TikTok | 同接口，境内服务器 | 出网被墙（`curl: (28) 连接超时`），应用**优雅降级**返回结构化错误而非 500；**非应用缺陷**，如需支持需海外出口 |
++| 服务器实机：运行时 | `systemctl show parse.service` | Node **22.23.2**（隔离安装于 `/opt/node22`），服务 `NRestarts=0`，常驻内存约 **95MB** |
++
++---
++
++## 七、安全提示（重要）
++
++认证门禁移除后，解析接口变为**完全开放**。应用内已有防护仅剩：
++
++- 基于 IP 的内存限流（60 次/分钟）
++- IP 黑名单 + 蜜罐响应
++- URL 合法性与 SSRF 校验
++
++> ⚠️ 注意内存限流是**单进程内存**：多副本 / PM2 cluster 时各副本独立计数，重启即清零。多副本场景要么换 Redis 计数，要么把限流上移到网关。
++
++服务器部署建议在**接入层**补一道防线：
++
++1. **反向代理限流**：nginx `limit_req_zone` 对 `/api/parse` 限速（例如单 IP 10 r/s、突发 20），或 Caddy / Traefik 的速率限制中间件；配合 `limit_conn` 限制并发连接。
++2. **封禁自动化**：`fail2ban` 或 nginx `deny` 规则，对高频 4xx/5xx 来源自动封禁，与应用层蜜罐形成互补。
++3. **出网与资源**：解析需抓取上游页面，注意容器 CPU/内存上限与出网带宽；部署脚本已用 `--init` 启动容器以回收 `yt-dlp` 等子进程。
++4. 若后续需要用户体系，**接入自建认证服务**，不要恢复对第三方认证服务的调用（该服务归原作者所有，其接口变更或停服会导致本站不可用）。
++
++> 说明：删除 `wrangler.toml` 只影响"把应用跑在 Cloudflare Workers 上"这条路径。若将来想把 Cloudflare 当作**前置 CDN / WAF**（回源到你自己的服务器），不需要恢复这些文件，直接在 DNS 层接即可。
++
++---
++
++## 八、提交、部署与回滚
++
++### 8.1 提交
++
++本仓库**已完成首次推送**（`origin` = 你的 fork；所用凭据含 `workflow` 权限）：
++
++```bash
++git add -A
++git commit -m "feat: self-host hardening — strip third-party auth, rebrand to 口袋时光, add overlay sync"
++git push origin main          # origin = 你的 fork
++```
++
++> **迁到新账号时**：首次推送含 `.github/workflows/` 改动，需用带 `workflow` 权限的凭据；
++> 之后到仓库 **Settings → Actions → General → Workflow permissions** 勾选
++> **Read and write permissions**，否则 `selfhost-sync.yml` 无法推送。
++
++启用 Actions 前请注意：
++
++- GitHub 对 fork 默认**关闭** Actions，需在 **Actions** 页手动启用，
++  `selfhost-sync.yml` 才会每天自动运行。
++- `cleanup-actions.yaml` 每天清理 cache 与旧 run，无害，可保留。
++- `deploy-to-docker.yaml` 已**默认关闭**：三个 job 都加了
++  `if: vars.ENABLE_DOCKER_DEPLOY == 'true'`。原因见 §8.2 ——
++  本服务器线上是 systemd，Docker 方案会抢同一个 3000 端口；且保留上游文件比
++  删掉更省心（每次同步都会被「固定为上一版本」，删了也会被带回来）。
++
++### 8.2 自动部署链路（上游更新 → 服务器，本次实际采用）
++
++`selfhost-sync.yml` 里新增了 `jobs.deploy`，与 `jobs.sync` 用 `needs` 串联，
++形成 **上游更新 → fork 仓库 → 服务器 systemd 服务** 的完整自动链路：
++
++```
++jobs.sync（见 §5.1）…… npm test → npm run build
++    → 打包 standalone 产物（补 .next/static 与 public）→ 上传 artifact
++    → 提交并推送（changed=true/false）
++
++jobs.deploy（needs: sync，仅 changed=true 或手动 force_deploy 时执行）
++    → 下载 artifact → SSH 上传到 DEPLOY_TMP_DIR
++    → 解到暂存目录并校验 server.js / .next/static
++    → 备份当前版本 → 原子替换 → chown → systemctl restart
++    → 健康检查（20 次 × 3s，HTTP 200 通过）
++        ├─ 通过 → 删除备份，任务成功
++        └─ 失败 → 挪回上一版本并重启，打印 journalctl，任务失败
++```
++
++**为什么必须写在同一个工作流里**：用默认 `GITHUB_TOKEN` 提交的推送
++**不会**触发其他工作流（GitHub 的反递归保护）。也就是说，如果指望
++`deploy-to-docker.yaml` 监听 `push` 来部署，`sync` 推完代码后它根本不会启动。
++要么同工作流内 `needs` 串联，要么用 PAT 推送 —— 这里选前者，少一个长期凭据。
++
++**变更检测**：只有 `sync` 真的推了新提交才部署。上游没动就不做无谓的构建与重启
++（`systemctl restart` 会让线上解析短暂中断）。需要强制重部署时，用
++`workflow_dispatch` 的 `force_deploy` 开关（例如只在服务器上改了 `.env`）。
++
++**需要的配置**：完整清单与一次性配置命令见
++[`selfhost/README.md` → 自动部署](selfhost/README.md)。最少需要三个 Secret：
++`DEPLOY_HOST`、`DEPLOY_USER`、`DEPLOY_SSH_KEY`（推荐专用用户 + 免密 sudo，
++不要用 root 密码）。其余路径 / 服务名 / 健康检查地址都有内置默认值，
++可用 Variables 覆盖。
++
++> 安全取舍：`DEPLOY_SSH_KEY` 是私钥，务必用**专用部署密钥**并只装到该服务器，
++> 服务器侧建议用 `command=` 或最小化 sudoers 收紧权限。当前仓库 Secrets 为空，
++> 因此 `deploy` 任务会以「缺少部署配置」明确报错中止，而不是静默跳过。
++
++### 8.3 备选：Docker 部署（默认已关闭）
++
++若改用 Docker，推送 `main` 后由 `.github/workflows/deploy-to-docker.yaml` 完成。
++**注意：需先在 Variables 里设 `ENABLE_DOCKER_DEPLOY = true` 才会运行**，
++并先停用 `selfhost-sync.yml` 里的 `deploy` 任务，否则两边同时抢 3000 端口。
++
++```
++npm test → 构建 GHCR 镜像（ghcr.io/<你的仓库>:latest）→ SSH 到服务器
++        → docker pull && docker stop/rm && docker run -d --init --env-file <ENV_FILE> -p <PORT>:3000
++```
++
++需要预先配置：
++
++| 类型 | 名称 | 用途 |
++| --- | --- | --- |
++| Secret | `DEPLOY_HOST` / `DEPLOY_USER` / `DEPLOY_PASSWORD` | 目标服务器 SSH 凭据 |
++| Variable | `DEPLOY_ENV_FILE` | 宿主机 `.env` 路径，默认 `/opt/parse/.env` |
++| Variable | `DEPLOY_PORT` | 宿主机映射端口，默认 `3000` |
++
++宿主机 `.env` 按 `.env.example` 填写（`NEXT_PUBLIC_*` 是**构建期**注入，需写进镜像构建环境或在容器内重新构建才能生效；其余如 `DOUYIN_COOKIE`、`STATS_API_KEY` 为运行期，放 `.env` 即可）。
++
++想手动部署也可以直接用仓库里的 `Dockerfile`：
++
++```bash
++docker build --build-arg BUILD_ID=$(git rev-parse HEAD) -t parse:local .
++docker run -d --init --env-file .env -p 3000:3000 parse:local
++```
++
++> `--build-arg BUILD_ID` 传稳定构建 ID，避免滚动更新时新旧容器的 Server Action / RSC 不一致。
++
++### 8.3.1 无 Docker 的服务器部署（手工首次部署）
++
++自动部署（§8.2）依赖服务器上已有的目录、服务与运行时，这些需要**先手工做一次**。
++若目标服务器不便装 Docker，可直接跑 `output: "standalone"` 产物 + systemd。要点与命令：
++
++```bash
++# 0) 本地：务必先设好站点地址（NEXT_PUBLIC_* 是构建期注入，改完必须重建）
++NEXT_PUBLIC_SITE_URL=http://<服务器IP>:3000 npm run build
++#    产物在 .next/standalone/：含 server.js、.next/、public/、node_modules/
++
++# 1) 打包上传（只传 standalone 三件套，约 24MB）
++#    把 .next/static 复制进 standalone/.next/static，把 public/ 复制到 standalone/public/
++tar -czf app.tar.gz -C .next/standalone .
++
++# 2) 服务器：建非 root 用户与目录
++useradd -r -s /usr/sbin/nologin parse
++mkdir -p /opt/parse/app && tar -xzf app.tar.gz -C /opt/parse/app
++chown -R parse:parse /opt/parse
++
++# 3) 运行时依赖：Node ≥ 22.19（见 §2.1）+ TikTok 解析所需的 yt-dlp / ffmpeg
++apt-get install -y ffmpeg && pip install -U yt-dlp
++
++# 4) 环境变量
++vim /opt/parse/.env      # 运行期变量；NODE_OPTIONS=--max-old-space-size=448 限制堆上限
++chmod 600 /opt/parse/.env
++```
++
++systemd 单元（`/etc/systemd/system/parse.service`）：
++
++```ini
++[Service]
++Type=simple
++User=parse
++Group=parse
++WorkingDirectory=/opt/parse/app
++EnvironmentFile=/opt/parse/.env
++Environment=PATH=/opt/node22/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
++ExecStart=/opt/node22/bin/node server.js
++Restart=always
++RestartSec=5s
++# 与宿主机其他服务共享资源，按需限制
++MemoryHigh=640M
++MemoryMax=768M
++CPUWeight=50
++# 安全加固（注意：不要设 MemoryDenyWriteExecute —— V8 JIT 需要可写可执行内存）
++NoNewPrivileges=true
++PrivateTmp=true
++PrivateDevices=true
++ProtectSystem=full
++ProtectHome=true
++ProtectKernelTunables=true
++ProtectKernelModules=true
++ProtectControlGroups=true
++RestrictSUIDSGID=true
++RestrictRealtime=true
++LockPersonality=true
++ReadWritePaths=/opt/parse
++```
++
++```bash
++systemctl daemon-reload && systemctl enable --now parse
++curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:3000/api/health   # 期望 200
++```
++
++**与 Docker 路径的差异（必须知情）**：
++
++| 项 | Docker | 无 Docker |
++| --- | --- | --- |
++| TikTok 解析 | 镜像内自带 `yt-dlp` + `ffmpeg` | **需自行在宿主机安装**，并在 `.env` 配 `YTDLP_BIN` |
++| 滚动更新 | 自动强制更新时 Old/新容器混跑的 RSC 不一致问题 | 无此问题（进程整体重启），但需自己保证构建 ID 稳定（`NEXT_BUILD_ID`） |
++| 依赖隔离 | 完全隔离 | 依赖宿主机；**Node 版本是硬约束**（§2.1） |
++| 反向代理 / 限流 | 一般由前置层负责 | 同样建议前置 nginx（§七） |
++
++> 如果服务器在**海外**，B 站会被 IP 风控（-412）：此时 `BILIBILI_RELAY_URL`（云函数中继）
++> 或 `BILIBILI_PROXY` 必须配置，不能按"国内服务器可直连"处理。本次部署在国内，故二者留空。
++
++### 8.4 回滚
++
++**代码层回滚**（丢弃本地全部改造）：
++
++```bash
++git checkout -- .      # 丢弃全部工作区改动
++git clean -fd          # 清理新增未跟踪文件（脚本、叠加层、文档）
++```
++
++**线上层回滚**（三种情形）：
++
++| 情形 | 做法 |
++| --- | --- |
++| 自动部署健康检查失败 | **已经自动回滚**了。任务日志会打印失败原因与 `journalctl -u parse -n 40`，修好后重跑 |
++| 部署成功但发现功能异常 | 服务器上 `/opt/parse/.backup.prev` 是上一个版本（成功部署后会删除，故通常不存在）。可靠做法是本地 `git revert` 那笔同步提交 → 推送 → 让流水线重新部署 |
++| 需要立刻止血 | 在 GitHub 上禁用 `selfhost-sync` 工作流（Settings → Actions），线上保持当前版本不动 |
++
++若只想**临时停用自动同步**，在 GitHub 上禁用 `selfhost-sync` 工作流即可，不影响已部署版本。

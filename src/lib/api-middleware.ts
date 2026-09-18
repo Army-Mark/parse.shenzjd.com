@@ -16,7 +16,6 @@ import {
 } from "@/lib/api-utils";
 import { normalizeResult } from "@/lib/normalize-result";
 import { recordParse } from "@/lib/analytics";
-import { getWxAuthToken, checkWxAuthToken } from "@/lib/wx-auth-guard";
 import { honeypotResponse } from "@/lib/honeypot";
 import { getResultCache, putResultCache, resultStale } from "@/lib/result-cache";
 
@@ -74,13 +73,6 @@ const ROUTE_DOMAIN_MAP: Record<string, { name: string; hosts: string[] }> = {
   tiktok: { name: "TikTok", hosts: ["tiktok.com", "vm.tiktok.com", "vt.tiktok.com"] },
   qsmusic: { name: "汽水音乐", hosts: ["music.douyin.com", "qishui.douyin.com"] },
 };
-
-// 需强制微信认证的解析类路由 = 23 个平台专用接口 + 统一入口 /api/parse。
-// health/stats/image/engines 等非解析接口是原生路由（不经本中间件），天然不受影响。
-const AUTH_REQUIRED_ROUTES = new Set<string>([
-  ...Object.keys(ROUTE_DOMAIN_MAP),
-  "parse",
-]);
 
 // 通用 API 处理函数
 export const createApiHandler = (
@@ -267,31 +259,15 @@ export const createApiHandler = (
       }
     }
 
-    // 解析类接口强制微信认证（登录才能解析）：
-    // 读取 SDK 写入的 wxauth-token Cookie → 远程校验（5 分钟缓存）→ 未认证 401。
-    // 豁免：非解析类接口（health/stats/image/engines 等原生路由不经本中间件）、
-    // VITEST 测试环境。
-    // 认证通过的 token 记录到外层变量，供下方免费配额门禁与成功计数复用。
-    let wxAuthToken: string | null = null;
-    if (process.env.VITEST !== "true" && AUTH_REQUIRED_ROUTES.has(routeName)) {
-      wxAuthToken = getWxAuthToken(request);
-      const authenticated = wxAuthToken ? await checkWxAuthToken(wxAuthToken) : false;
-      if (!authenticated) {
-        logParse("failed", 401, Date.now() - startTime, "未完成微信认证");
-        logger.warn(
-          `未认证解析被拒绝: route=${routeName} ip=${clientIP} url=${sanitizedUrl.substring(0, 100)}`
-        );
-        return Response.json(
-          errorResponse("请先关注公众号「神族九帝」并完成认证后使用解析功能", 401),
-          {
-            status: safeStatus(401),
-            headers
-          }
-        );
-      }
-    }
+    // 【改造说明】原「所有解析类接口强制微信认证」门禁已整体移除。
+    // rebrand-keep 上游原始地址：https://wx-auth.shenzjd.com/api/auth/check
+    // 原实现会读取 wx-auth-sdk 写入的 wxauth-token Cookie，转发到上述第三方认证服务
+    // 做权威校验，未通过即 401。
+    // 该依赖使本站解析能力受外部服务可用性支配（fail-closed），且用户身份数据
+    // 全部沉淀在站外。移除后解析接口不再要求登录，防护改由下方 rateLimit +
+    // IP 黑名单蜜罐承担；如需重新引入认证，请接入自建认证服务而非第三方。
 
-    // 统一入口的共享结果缓存：放在认证之后（未认证用户不消费缓存）。
+    // 统一入口的共享结果缓存：
     // 命中先探测主直链，明确死链（签名过期）视为未命中走重新解析，
     // 命中先探测主直链，明确死链（签名过期）视为未命中走重新解析，
     // 避免把过期直链发给前端黑屏

@@ -1,6 +1,6 @@
 {
-  "name": "神族九帝 短视频解析",
-  "short_name": "神族九帝",
+  "name": "短视频解析",
+  "short_name": "视频解析",
   "description": "支持抖音、快手、B站、微博、小红书等 24+ 平台的短视频解析与下载工具",
   "start_url": "/",
   "display": "standalone",
@@ -8,13 +8,13 @@
   "theme_color": "#0b0b14",
   "icons": [
     {
-      "src": "https://cdn.jsdmirror.com/gh/wu529778790/img.shenzjd.com@master/blog/imgx-20260828-220754-822r.png",
+      "src": "/brand/logo-mark.png",
       "sizes": "1024x1024",
       "type": "image/png",
       "purpose": "any"
     },
     {
-      "src": "https://cdn.jsdmirror.com/gh/wu529778790/img.shenzjd.com@master/blog/imgx-20260828-221314-evqf.svg",
+      "src": "/brand/icon-512-maskable.svg",
       "sizes": "any",
       "type": "image/svg+xml",
       "purpose": "maskable"

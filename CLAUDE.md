@@ -33,7 +33,9 @@ export const GET = createApiHandler(douyin);
 
 Platform routes are **externally blocked** — `createApiHandler()` (in `src/lib/api-middleware.ts`) returns 403 for every route in its `ROUTE_DOMAIN_MAP` except `/api/parse`; they exist as shells for possible future re-exposure. The unified entry `/api/parse` does NOT forward over HTTP: it resolves parsers via `getPlatformParser()` (`src/lib/platformRoutes.js`, lazy `import()` of the lib modules) and calls the function directly. Never reintroduce an internal-forwarding marker header — a client-forgeable header (`x-parse-internal`) once bypassed auth/quota/analytics.
 
-`createApiHandler()` wraps the unified entry with: WeChat auth guard (wxauth-token cookie / Bearer → remote check via wx-auth, 5-min per-token cache), free-quota + ad-unlock gate (in-memory, single-process only), IP-based rate limiting (60 req/min, in-memory), URL validation, SSRF protection, honeypot for blacklisted IPs, CORS, and error handling. `/api/parse` passes `sharedCache` — a 24-hour result cache (`src/lib/result-cache.js`; Cloudflare Cache API on Workers, in-memory Map fallback on Node) storing the normalized result; on hit it probes the direct URL and re-parses when the cached link is definitively dead (404/410). All routes run on Node.js runtime.
+`createApiHandler()` wraps the unified entry with: IP-based rate limiting (60 req/min, in-memory), URL validation, SSRF protection, honeypot for blacklisted IPs, CORS, and error handling. `/api/parse` passes `sharedCache` — a 24-hour result cache (`src/lib/result-cache.js`; Cloudflare Cache API on Workers, in-memory Map fallback on Node) storing the normalized result; on hit it probes the direct URL and re-parses when the cached link is definitively dead (404/410). All routes run on Node.js runtime.
+
+> **认证已移除（本分支改造）**：`createApiHandler()` 原来的「微信认证守卫」（读取 `wxauth-token` Cookie / `Authorization: Bearer`，再远程调用第三方 `wx-auth.113826.xyz/api/auth/check` 校验，未通过返回 401）以及「免费配额 + 广告解锁门禁」均已删除，同时删除了前端 `wx-auth-client.ts`、服务端 `wx-auth-guard.ts`、`floating-unlock-*` 与页面内引入的作者 unpkg 组件（`site-navbar` / `floating-qr`）。解析接口现为开放访问，防护仅由 rate limit、IP 黑名单蜜罐与 URL/SSRF 校验承担。**不要重新引入对第三方认证服务的调用**；如确需登录能力，请接入自建认证服务。CORS 放行名单改由环境变量 `ALLOWED_ORIGINS` 控制（逗号分隔，未配置则不放行跨域）。`/api/stats` 改用 `Authorization: Bearer <STATS_API_KEY>` 鉴权，未配置时返回 503。
 
 Analytics (`src/lib/analytics.js`) buffers parse events in memory and batch-flushes them to Turso (20 events or 30s, one pipeline request); `queryStats()` caches its full-table aggregation for 5 minutes — do not reintroduce per-request DB writes/reads.
 
@@ -73,3 +75,7 @@ Configure in `.env` for full functionality:
 ## Deployment
 
 Three targets: Vercel (one-click), Cloudflare Workers (`wrangler.toml`), Docker (GHCR + Docker Hub via GitHub Actions). The Docker CI workflow runs unit tests before building.
+
+> 【自建改造】本 fork 的部署目标已收敛为 **Docker / 自建服务器**（`Dockerfile` + `.github/workflows/deploy-to-docker.yaml`）。
+> Cloudflare 专用件（`wrangler.toml`、`open-next.config.ts`、`npm run build:cf`、`@opennextjs/cloudflare`）**已删除，不要重新引入**；
+> 上游同步任务会由 `scripts/selfhost-guard.mjs` 拦住回退。

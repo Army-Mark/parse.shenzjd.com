@@ -23,8 +23,11 @@ import { DELETED_CONTENT_MSG } from "@/lib/api-utils";
 const TTL_SECONDS = 24 * 60 * 60;
 /** 内存兜底上限（非 Workers 环境），防本地长跑内存膨胀 */
 const MEMORY_MAX = 500;
-// 合成缓存源：仅作 Cache API 的 key，从不真实请求
-const CACHE_KEY_BASE = "https://result-cache.parse.shenzjd.com/api/parse?url=";
+// 合成缓存源：仅作 Cache API 的 key，从不真实请求。
+// 【改造说明】原 key 硬编码上游作者域名（result-cache.parse.shenzjd.com），[rebrand-keep]
+// 自建部署若与作者同处一个 Cloudflare 账户/同一 Cache 命名空间会相互串味。
+// 现按本站地址派生 key，使每个部署实例的缓存彼此隔离。
+const CACHE_KEY_BASE = `${process.env.NEXT_PUBLIC_SITE_URL || "https://result-cache.local"}/__result-cache/api/parse?url=`;
 
 const memoryCache = new Map(); // url → { result, expiresAt }
 

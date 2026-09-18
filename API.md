@@ -4,7 +4,7 @@
 
 ## 基础信息
 
-- **Base URL**: `https://parse.shenzjd.com` 或本地 `http://localhost:3000`
+- **Base URL**: `https://parse.113826.xyz` 或本地 `http://localhost:3000`
 - **响应格式**: JSON
 - **跨域支持**: 所有接口均支持 CORS
 
@@ -460,7 +460,8 @@ STATS_API_KEY=your_stats_key
 # VIDEO_PARSE_ENABLED=true
 ```
 
-> Cloudflare Workers 部署时：`BILIBILI_USER_AGENT` 已写入 `wrangler.toml` 的 `[vars]`；Cookie 类敏感值在 CI 中由 GitHub Secrets 自动 `wrangler secret put` 注入，无需手动配置。
+> 【自建改造】自建版仅支持 Docker / 服务器部署：敏感值（`DOUYIN_COOKIE`、`WEIBO_COOKIE`、`TURSO_AUTH_TOKEN`、`STATS_API_KEY` 等）统一写入宿主机 `.env`，由 `docker run --env-file` 注入，无需任何云端控制台配置。
+> `BILIBILI_USER_AGENT` 是代码内常量（见 `src/lib/bilibili-fetch.js`），不通过环境变量配置。
 
 ---
 
@@ -498,8 +499,8 @@ if (data.code === 200) {
 
 ```bash
 # 抖音解析
-curl "https://parse.shenzjd.com/api/douyin?url=https://v.douyin.com/xxx/"
+curl "https://parse.113826.xyz/api/douyin?url=https://v.douyin.com/xxx/"
 
 # 健康检查
-curl "https://parse.shenzjd.com/api/health"
+curl "https://parse.113826.xyz/api/health"
 ```
